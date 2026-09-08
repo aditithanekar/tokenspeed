@@ -2230,8 +2230,13 @@ def _dsv4_combine_topk_swa_indices_kernel(
             other=-1,
         )
         valid_topk = topk_mask & (topk_values >= 0)
+        valid_topk_i32 = valid_topk.to(tl.int32)
+        compact_topk_offsets = tl.cumsum(valid_topk_i32, 0) - 1
+        compact_topk_len = tl.sum(valid_topk_i32, axis=0)
         tl.store(
-            combined_indices_ptr + token_idx * combined_indices_stride + topk_offsets,
+            combined_indices_ptr
+            + token_idx * combined_indices_stride
+            + compact_topk_offsets,
             topk_values + workspace_width * batch_idx,
             mask=valid_topk,
         )
@@ -2240,7 +2245,7 @@ def _dsv4_combine_topk_swa_indices_kernel(
         tl.store(
             combined_indices_ptr
             + token_idx * combined_indices_stride
-            + topk_len
+            + compact_topk_len
             + swa_offsets,
             workspace_width * batch_idx
             + compressed_base
@@ -2252,7 +2257,7 @@ def _dsv4_combine_topk_swa_indices_kernel(
             mask=swa_offsets < swa_len,
         )
 
-        tl.store(combined_lens_ptr + token_idx, topk_len + swa_len)
+        tl.store(combined_lens_ptr + token_idx, compact_topk_len + swa_len)
 
 
 def dsv4_combine_topk_swa_indices(
