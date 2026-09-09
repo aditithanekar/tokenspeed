@@ -268,13 +268,17 @@ class DeviceHandle:
     ) -> PendingExecution | None:
         """Execute one scheduler plan; never blocks on the per-round path.
 
-        The whole plan on the FIFO -- one thread, one stream -- in an order
+        The whole plan on the FIFO -- one thread, explicitly ordered streams -- in an order
         that IS the correctness argument for same-round page reuse:
-        retraction write-backs first (they must read the reused pages' old
-        bytes), then page zeroing (the new owner's sanitization), then
-        load-backs (they target zeroed pages), the transfer peer's remote
-        streams, and finally the ``ForwardBatch``. The loop hands the round
-        over and does not branch on it.
+        write-backs first (a stream-ordered one -- a retraction's snapshot,
+        whose sources this plan may re-grant -- fences the caller's stream
+        on its completion so it reads the reused pages' old bytes; a pinned
+        one -- an ordinary publication, whose sources the scheduler holds
+        until the ACK -- rides the write stream and fences nothing), then
+        page zeroing (the new owner's sanitization), then load-backs (they
+        target zeroed pages), the transfer peer's remote streams, and finally
+        the ``ForwardBatch``. The loop hands the round over and does not
+        branch on it.
 
         Args:
             execution_plan: The round's plan, a per-round value copy out of
@@ -304,10 +308,19 @@ class DeviceHandle:
         executor = self._executor
         l2 = self._l2 if execution_plan.cache else None
         if l2 is not None:
-            # Ahead of the zeroing: a retraction's snapshot sources may be
-            # this very plan's pages_to_zero.
+            # Ahead of the zeroing: a stream-ordered store's sources may be
+            # this very plan's pages_to_zero, and its fence lands on the
+            # default stream the zeroing runs on, before the zeroing is
+            # enqueued. The copies themselves order behind the execution
+            # stream, where the forwards wrote the pages.
             self._l2_submissions.append(
-                self._thread.submit(lambda: l2.submit_write_backs(execution_plan))
+                self._thread.submit(
+                    lambda: l2.submit_write_backs(
+                        execution_plan,
+                        prerequisite_stream=executor.execution_stream,
+                        fence_stream=executor.default_stream,
+                    )
+                )
             )
         pages = execution_plan.pages_to_zero
         zero_future = (
@@ -316,8 +329,14 @@ class DeviceHandle:
             else None
         )
         if l2 is not None:
+            # Behind the zeroing: the loads' destinations were zeroed on the
+            # default stream, so that is the prerequisite they order after.
             self._l2_submissions.append(
-                self._thread.submit(lambda: l2.submit_load_backs(execution_plan))
+                self._thread.submit(
+                    lambda: l2.submit_load_backs(
+                        execution_plan, prerequisite_stream=executor.default_stream
+                    )
+                )
             )
 
         # The transfer peer's streams: prefills or decodes the peer NODE runs,
@@ -449,10 +468,10 @@ class DeviceHandle:
         pages, so it must follow them and the zeroing fence (Mooncake and
         GPUDirect writes are not ordered by the zeroing stream, so the
         destination pages must be published from sanitized memory). The same
-        fence covers a retraction write-back reading pages this admission was
-        granted: the zero event is recorded on the forward thread's stream
-        AFTER the write-back copies, so waiting on it waits on them too. One
-        ordered
+        fence covers a retraction's stream-ordered write-back reading pages
+        this admission was granted: the zero event is recorded on the forward
+        thread's stream AFTER that stream waited on the write-back's
+        completion, so waiting on it waits on the copy too. One ordered
         unit, so one submission — asynchronous like every other: completion
         arrives through the transfer events, and a submission failure
         surfaces from the settle at the next round's execute.
@@ -978,7 +997,7 @@ def _build_kv_transfer(
         ),
         kv_args=get_kv_args(
             global_rank,
-            global_rank,
+            gpu_id,  # local CUDA index; new threads do not inherit current_device
             server_args.disaggregation_ib_device,
             executor.token_to_kv_pool,
             model_config=model_config,

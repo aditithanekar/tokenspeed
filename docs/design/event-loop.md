@@ -239,7 +239,9 @@ SMG startup handshake lives in `zmq_msgpack.connect_msgpack_engine_for_loop`
 `multimodal/inputs.py::multimodal_context_for_forward` (which also snapshots
 each request's multimodal inputs, per Principle 1's capture contract), and
 P-side layerwise KV streaming setup, which happens inside the device builder
-(the step counter is backend surgery; the sender just receives it).
+(the step counter is backend surgery; the sender just receives it). Dest-
+contiguous CachePD fragments are 2D-packed in the Prefill transfer path
+before Mooncake WRITE — that CUDA copy is data-plane work, not loop work.
 
 All hooks obey Principle 3: they return events or decisions; they never call
 `advance_scheduler`.
@@ -260,11 +262,14 @@ For orientation, one iteration of `event_loop`:
 4. **One `DeviceHandle.execute(plan, planned)` call per round**, in an order
    that is itself a correctness contract for same-round page reuse:
    host-cache write-backs first (a retraction's snapshot copy must read the
-   reused pages' old bytes), then page zeroing (the new owner's
+   reused pages' old bytes, so its op is stream-ordered and fences the
+   forward thread's stream on its completion here; an ordinary store's
+   sources are pinned by the scheduler until the ACK, so its copy rides the
+   write stream and fences nothing), then page zeroing (the new owner's
    sanitization), then load-backs (they target zeroed pages), then the
    plan's remote streams to the transfer peer (a D-node remote prefill
    waits on the zeroing fence inside its submission, which the FIFO orders
-   after the write-backs), then the plan's batch to the model. `planned` is
+   after the write-back fence), then the plan's batch to the model. `planned` is
    None on idle and empty rounds; the plan's own work (hygiene, the remote
    streams) still runs. Then commit from the queue head down to the
    effective depth and poll PD transfer events.

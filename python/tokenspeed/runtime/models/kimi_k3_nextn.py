@@ -76,7 +76,6 @@ class KimiK3DraftAttentionMLA(KimiLinearMLAAttention, DeepseekV3DraftAttentionML
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         comm_manager,
         block_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
@@ -97,7 +96,6 @@ class KimiK3DraftAttentionMLA(KimiLinearMLAAttention, DeepseekV3DraftAttentionML
             q,
             latent_cache,
             ctx,
-            out_cache_loc,
             absorbed_query=absorbed_query,
         )
         if gate is not None:
@@ -151,6 +149,8 @@ class KimiK3DraftDecoderLayer(nn.Module):
             mapping=mapping,
             layer_index=0,
             model_scope=model_scope,
+            # One block, re-entered every draft step: nothing rotates.
+            moe_block_count=1,
             quant_config=quant_config,
             prefix=add_prefix("block_sparse_moe", prefix),
             alt_stream=alt_stream,
@@ -188,7 +188,6 @@ class KimiK3DraftDecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
     ) -> torch.Tensor:
         num_global_tokens, max_num_tokens_per_gpu = self.comm_manager.get_num_tokens(
             ctx
@@ -199,11 +198,10 @@ class KimiK3DraftDecoderLayer(nn.Module):
                 positions=positions,
                 hidden_states=self.input_layernorm(hidden_states),
                 ctx=ctx,
-                out_cache_loc=out_cache_loc,
                 comm_manager=self.comm_manager,
             )
             if (
-                ctx.accept_lengths is not None
+                ctx.draft_narrowing is not None
                 and attn_out.shape[0] != residual.shape[0]
             ):
                 residual = residual.index_select(0, ctx.gather_ids)
@@ -267,7 +265,6 @@ class KimiK3ModelNextN(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
         captured_hidden_states: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, None]:
@@ -284,7 +281,7 @@ class KimiK3ModelNextN(nn.Module):
                 dim=-1,
             )
         )
-        hidden_states = self.decoder(positions, hidden_states, ctx, out_cache_loc)
+        hidden_states = self.decoder(positions, hidden_states, ctx)
         return self.shared_head.norm(hidden_states), None
 
 
@@ -350,14 +347,12 @@ class KimiK3NextNForCausalLM(nn.Module):
         ctx: ForwardContext,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        out_cache_loc: torch.Tensor,
         captured_hidden_states: torch.Tensor | None = None,
     ) -> torch.Tensor:
         hidden_states, _ = self.model(
             input_ids,
             positions,
             ctx,
-            out_cache_loc,
             captured_hidden_states=captured_hidden_states,
         )
         logits_metadata = LogitsMetadata.from_forward_context(ctx)

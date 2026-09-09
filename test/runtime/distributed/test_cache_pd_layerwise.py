@@ -562,7 +562,7 @@ def test_layerwise_fanout_is_layer_major_and_completes_once() -> None:
 
     manager._cache_transfer_blocks = cache_transfer_blocks
 
-    def transfer_data(session, blocks):
+    def transfer_data(session, blocks, packer=None):
         events.append(("send", session, tuple(blocks)))
         return 0
 
@@ -631,7 +631,7 @@ def test_layerwise_fanout_failure_aborts_before_later_intervals() -> None:
     )
     manager._cache_transfer_blocks = lambda **_kwargs: iter(((1, 2, 3),))
 
-    def transfer(session, _blocks):
+    def transfer(session, _blocks, packer=None):
         events.append(("send", session))
         return -1 if session == "session-1" else 0
 
@@ -656,7 +656,7 @@ def test_dsa_sparse_prefill_publishes_one_cache_step_after_cache_use(
 ) -> None:
     import torch
 
-    from tokenspeed.runtime.layers.attention.backends import dsa as dsa_backend
+    from tokenspeed.runtime.layers.attention.backends.paged import dsa as dsa_backend
 
     events = []
     backend = object.__new__(dsa_backend.DSABackend)

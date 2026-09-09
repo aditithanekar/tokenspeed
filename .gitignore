@@ -91,7 +91,7 @@ celerybeat.pid
 .python-version
 .env
 .envrc
-.venv
+.venv*
 env/
 venv/
 ENV/
@@ -196,3 +196,4 @@ Testing/
 .serena/*
 
 AGENTS.local.md
+outputs/

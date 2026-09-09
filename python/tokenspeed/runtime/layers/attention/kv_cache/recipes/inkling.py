@@ -37,7 +37,6 @@ from tokenspeed.runtime.layers.attention.configs.base import (
     SoftmaxAttnConfig,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.base import (
-    CacheGroupDeclaration,
     CacheRecipe,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
@@ -48,6 +47,7 @@ from tokenspeed.runtime.layers.attention.kv_cache.recipes.plan import (
     scatter_stored_dtype_name,
 )
 from tokenspeed.runtime.layers.attention.kv_cache.recipes.spec import (
+    CacheGroupDeclaration,
     CacheGroupSpec,
     apply_pd_transfer_policies,
 )
@@ -70,7 +70,7 @@ class InklingRecipe(CacheRecipe):
     @property
     @override
     def num_target_layers(self) -> int:
-        return len(self.attn_config.component(SoftmaxAttnConfig).layer_types)
+        return len(self.attn_config.component(SoftmaxAttnConfig).cache_layer_types)
 
     @property
     @override
@@ -88,11 +88,11 @@ class InklingRecipe(CacheRecipe):
 
     @cached_property
     def layer_types(self) -> tuple[str, ...]:
-        target = tuple(self.attn_config.component(SoftmaxAttnConfig).layer_types)
+        target = tuple(self.attn_config.component(SoftmaxAttnConfig).cache_layer_types)
         if self.draft_attn_config is None:
             return target
         return target + tuple(
-            self.draft_attn_config.component(SoftmaxAttnConfig).layer_types
+            self.draft_attn_config.component(SoftmaxAttnConfig).cache_layer_types
         )
 
     @property

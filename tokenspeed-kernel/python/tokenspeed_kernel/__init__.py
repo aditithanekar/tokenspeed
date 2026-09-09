@@ -69,6 +69,7 @@ from tokenspeed_kernel.ops.attention import (
     rel_mha_extend_with_kvcache,
     rel_mha_plan,
     rel_mha_prefill,
+    supports_mla_decode_query_blocks,
 )
 from tokenspeed_kernel.ops.gemm import (
     bmm,
@@ -79,6 +80,7 @@ from tokenspeed_kernel.ops.gemm import (
     dsv4_grouped_output_projection_warmup_model,
     dsv4_linear_fp32,
     fp8_linear,
+    has_flashinfer_cute_dsl_nvfp4_a16,
     kimi3_latent_projection,
     kimi3_latent_projection_add3,
     kimi3_mla_qkv_gate_projection,
@@ -88,6 +90,7 @@ from tokenspeed_kernel.ops.gemm import (
     kimi3_shared_situ_projection,
     mm,
     prepare_fp8_linear,
+    prepare_nvfp4_a16_weights,
     warmup_prepared_fp8_linears,
 )
 from tokenspeed_kernel.ops.hyperconnection import (
@@ -133,6 +136,7 @@ __all__ = [
     "dsv4_grouped_output_projection_warmup_model",
     "dsv4_linear_fp32",
     "fp8_linear",
+    "has_flashinfer_cute_dsl_nvfp4_a16",
     "kimi3_latent_projection",
     "kimi3_mla_qkv_gate_projection",
     "kimi3_latent_projection_add3",
@@ -142,6 +146,7 @@ __all__ = [
     "kimi3_shared_situ_projection",
     "mm",
     "prepare_fp8_linear",
+    "prepare_nvfp4_a16_weights",
     "warmup_prepared_fp8_linears",
     # hyperconnection
     "gated_residual_combine",
@@ -160,6 +165,7 @@ __all__ = [
     "mla_prefill",
     "mla_extend_with_kvcache",
     "mla_decode_with_kvcache",
+    "supports_mla_decode_query_blocks",
     "mla_use_absorbed_extend",
     "mla_normalize_project_query",
     "mla_project_value",

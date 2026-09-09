@@ -28,7 +28,9 @@ from tokenspeed.runtime.configs.model_config import ModelConfig
 from tokenspeed.runtime.layers.attention.configs.base import (
     AttnConfig,
     SoftmaxAttnConfig,
+    is_block_drafter,
     model_wide_kwargs,
+    resolve_cache_layer_types,
     resolve_dtype,
 )
 from tokenspeed.runtime.utils.server_args import ServerArgs
@@ -45,11 +47,10 @@ def resolve_mla_kv_cache_dtype(
     for the draft continuation fields. Other MLA drafts continue to honor the
     global cache setting.
     """
-    hf_config = getattr(model_config, "hf_config", None)
     if (
         is_draft
         and server_args.speculative_algorithm == "DSPARK"
-        and getattr(hf_config, "model_type", None) == "k3_dspark"
+        and getattr(model_config.hf_config, "model_type", None) == "k3_dspark"
     ):
         return torch.bfloat16
     return resolve_dtype(server_args.kv_cache_dtype)
@@ -72,11 +73,13 @@ class MLAConfig(SoftmaxAttnConfig):
         cls, server_args: ServerArgs, model_config: ModelConfig, is_draft: bool
     ) -> dict:
         """MLA component fields, shared with the DSA subclass."""
-        hf_config = getattr(model_config, "hf_config", None)
-        layer_types = tuple(
-            getattr(hf_config, "cache_layer_types", None)
-            or getattr(hf_config, "layer_types", None)
-            or ()
+        cache_layer_types = resolve_cache_layer_types(
+            model_config.hf_config,
+            num_layers=model_config.num_attention_layers,
+            is_draft=is_draft,
+            draft_block_decode=is_block_drafter(
+                server_args.speculative_algorithm, is_draft
+            ),
         )
         return dict(
             backend_name=(
@@ -94,15 +97,15 @@ class MLAConfig(SoftmaxAttnConfig):
             v_head_dim=model_config.v_head_dim,
             scaling=model_config.scaling,
             kv_cache_dim=model_config.kv_lora_rank + model_config.qk_rope_head_dim,
-            layer_types=layer_types,
+            cache_layer_types=cache_layer_types,
         )
 
     @classmethod
     def generate(
         cls, server_args: ServerArgs, model_config: ModelConfig, is_draft: bool = False
     ) -> AttnConfig:
-        draft_block_decode = bool(
-            is_draft and server_args.speculative_algorithm in ("DFLASH", "DSPARK")
+        draft_block_decode = is_block_drafter(
+            server_args.speculative_algorithm, is_draft
         )
         spec = cls(**cls._spec_kwargs(server_args, model_config, is_draft))
         return AttnConfig(

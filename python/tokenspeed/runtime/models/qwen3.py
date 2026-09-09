@@ -41,7 +41,10 @@ from tokenspeed.runtime.layers.linear import (
     QKVParallelLinear,
     RowParallelLinear,
 )
-from tokenspeed.runtime.layers.paged_attention import PagedAttention
+from tokenspeed.runtime.layers.paged_attention import (
+    PagedAttention,
+    hf_sliding_window_to_window_left,
+)
 from tokenspeed.runtime.layers.quantization.base_config import QuantizationConfig
 from tokenspeed.runtime.layers.rotary_embedding import get_rope
 from tokenspeed.runtime.layers.utils import get_layer_id
@@ -174,13 +177,23 @@ class Qwen3Attention(nn.Module):
             base=rope_theta,
             rope_scaling=rope_scaling,
         )
+        # Visibility only; the cache plan decides storage (bound at startup).
+        sliding_window_size = -1
+        if config.layer_types[layer_id] == "sliding_attention":
+            if config.sliding_window is None:
+                raise ValueError(
+                    "Qwen3 sliding_attention layers require config.sliding_window."
+                )
+            sliding_window_size = hf_sliding_window_to_window_left(
+                config.sliding_window
+            )
         self.attn = PagedAttention(
             self.num_heads,
             self.head_dim,
             self.scaling,
             num_kv_heads=self.num_kv_heads,
             layer_id=layer_id,
-            group_id=config.layer_types[layer_id],
+            sliding_window_size=sliding_window_size,
         )
 
     def _apply_qk_norm(
@@ -207,14 +220,13 @@ class Qwen3Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         cos_sin: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self._apply_qk_norm(q, k)
         q, k = self.rotary_emb(positions, q, k)
-        attn_output = self.attn(q, k, v, ctx, out_cache_loc)
+        attn_output = self.attn(q, k, v, ctx)
         if len(attn_output.size()) == 3:
             attn_output = attn_output.reshape(attn_output.shape[0], -1)
         output, _ = self.o_proj(attn_output)
@@ -276,7 +288,6 @@ class Qwen3DecoderLayer(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         residual: torch.Tensor | None,
         cos_sin: tuple[torch.Tensor, torch.Tensor] | None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -303,7 +314,6 @@ class Qwen3DecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
             ctx=ctx,
-            out_cache_loc=out_cache_loc,
             cos_sin=cos_sin,
         )
 
@@ -370,7 +380,6 @@ class Qwen3Model(nn.Module):
         input_ids: torch.Tensor,
         positions: torch.Tensor,
         ctx: ForwardContext,
-        out_cache_loc: torch.Tensor,
         input_embeds: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, None]:
         if input_embeds is None:
@@ -385,7 +394,6 @@ class Qwen3Model(nn.Module):
                 positions,
                 hidden_states,
                 ctx,
-                out_cache_loc,
                 residual,
                 cos_sin=None,
             )

@@ -62,8 +62,6 @@ def _model_wide_kwargs(**overrides) -> dict:
         kernel_page_size=64,
         context_len=1024,
         max_bs=2,
-        max_graph_bs=2,
-        max_scheduled_tokens=128,
     )
     kwargs.update(overrides)
     return kwargs
@@ -76,7 +74,7 @@ def _mha_config() -> AttnConfig:
         num_kv_heads=1,
         head_dim=2,
         attn_tp_size=1,
-        layer_types=(),
+        cache_layer_types=(),
     )
     return AttnConfig(components=(spec,), **_model_wide_kwargs())
 
@@ -109,7 +107,6 @@ def _msa_config() -> AttnConfig:
         sparse_layer_ids=frozenset({1}),
         index_head_dim=4,
         index_n_heads=1,
-        index_block_size=64,
         index_topk_blocks=1,
         index_init_blocks=1,
         index_local_blocks=1,
@@ -143,6 +140,7 @@ class _SyntheticHybridRecipe(CacheRecipe):
             model_config=None,
             attn_config=_ns_config(
                 prefix_granularity=4,
+                pd_disaggregation_enabled=False,
                 spec=SimpleNamespace(sliding_window_tokens=windows),
             ),
             draft_model_config=None,
@@ -267,7 +265,7 @@ def test_qwen_recipe_preserves_backend_kernel_page_size() -> None:
                 num_kv_heads=1,
                 head_dim=2,
                 attn_tp_size=1,
-                layer_types=(LINEAR_ATTENTION, FULL_ATTENTION),
+                cache_layer_types=(LINEAR_ATTENTION, FULL_ATTENTION),
             ),
             _tiny_linear_attn(),
         ),
@@ -340,7 +338,7 @@ def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
         num_kv_heads=1,
         head_dim=2,
         attn_tp_size=1,
-        layer_types=(LINEAR_ATTENTION, FULL_ATTENTION),
+        cache_layer_types=(LINEAR_ATTENTION, FULL_ATTENTION),
     )
     attn_config = AttnConfig(
         components=(target_spec, _tiny_linear_attn()),
@@ -348,7 +346,7 @@ def test_qwen_recipe_sizes_verify_workspace_for_replay_ssm(
     )
     draft_config = replace(
         attn_config,
-        components=(replace(target_spec, layer_types=(FULL_ATTENTION,)),),
+        components=(replace(target_spec, cache_layer_types=(FULL_ATTENTION,)),),
     )
     server_args = SimpleNamespace(
         block_size=64,
@@ -820,7 +818,7 @@ def test_ordinary_profile_reserves_null_page_inside_budget() -> None:
     recipe.server_args = SimpleNamespace(max_total_tokens=None)
     recipe.attn_config = _ns_config(
         prefix_granularity=64,
-        spec=SimpleNamespace(layer_types=(), sliding_window_tokens=None),
+        spec=SimpleNamespace(cache_layer_types=(), sliding_window_tokens=None),
         cache_cell_size=lambda: 16,
     )
     recipe.draft_attn_config = None

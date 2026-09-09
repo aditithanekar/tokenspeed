@@ -1640,6 +1640,78 @@ def mla_extend_with_kvcache(
         )
 
 
+def supports_mla_decode_query_blocks(
+    *,
+    q_dtype: torch.dtype,
+    kv_dtype: torch.dtype,
+    page_size: int,
+    num_q_heads: int,
+    q_len: int,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+    sliding_window: bool,
+    solution: str | None = None,
+) -> bool:
+    """Whether an MLA decode kernel takes a proposal block on the query axis.
+
+    A block drafter can lay its proposal out two ways: one flattened row per
+    block position, each carrying the block-end cache length, or the block on
+    the query axis with one page table row per request. Both spell the same
+    mask, but a kernel serves one or the other, so the caller has to know
+    which before it builds the metadata.
+
+    ``True`` means the selected kernel declared both this ``q_len`` and a
+    proposal block of that width. A kernel that merely omits a trait matches by
+    omission, which is not proof, so omission answers ``False``.
+
+    Args:
+        q_dtype: Query dtype.
+        kv_dtype: KV cache dtype.
+        page_size: Tokens per KV cache page.
+        num_q_heads: Query heads this rank owns.
+        q_len: Query rows per request, i.e. the proposal block width.
+        kv_lora_rank: MLA latent width.
+        qk_rope_head_dim: RoPE width.
+        sliding_window: Whether the layer bounds its history, since a kernel
+            may serve one of the two masks and not the other.
+        solution: The solution the call will pin, so the answer is about the
+            kernel that call will actually reach.
+
+    Returns:
+        Whether the block may be handed over on the query axis.
+    """
+    try:
+        kernel = select_kernel(
+            "attention",
+            "mla_decode_with_kvcache",
+            format_signature(
+                q=dense_tensor_format(q_dtype),
+                kv_cache=dense_tensor_format(kv_dtype),
+            ),
+            traits={
+                "sliding_window": sliding_window,
+                "page_size": page_size,
+                "q_len": q_len,
+                "num_q_heads": num_q_heads,
+                "kv_lora_rank": kv_lora_rank,
+                "qk_rope_head_dim": qk_rope_head_dim,
+                "support_logit_cap": False,
+                "return_lse": False,
+                "block_on_query_axis": True,
+                "noncausal_block_size": q_len,
+            },
+            solution=solution,
+        )
+    except NoKernelFoundError:
+        return False
+    spec = KernelRegistry.get().get_by_name(kernel.name)
+    if spec is None:
+        return False
+    return q_len in spec.traits.get("q_len", ()) and q_len in spec.traits.get(
+        "noncausal_block_size", ()
+    )
+
+
 def mla_decode_with_kvcache(
     # attention inputs
     q: torch.Tensor,
@@ -1656,6 +1728,8 @@ def mla_decode_with_kvcache(
     logit_cap: float = 0.0,
     return_lse: bool = False,
     out: torch.Tensor | None = None,
+    window_left: int = -1,
+    noncausal_block_size: int = 1,
     # dispatch options
     override: str | None = None,
     solution: str | None = None,
@@ -1693,6 +1767,19 @@ def mla_decode_with_kvcache(
         qk_rope_head_dim: RoPE q/k head dim.
         softmax_scale: Scale applied to QK logits before softmax.
         logit_cap: Optional soft cap applied to attention logits.
+        window_left: Number of historical positions visible to the first query
+            in a proposal block, or -1 for full attention. A non-causal row
+            also sees the whole proposal block. DFlash2 passes the model's
+            ``sliding_window - 1`` value here.
+        noncausal_block_size: Proposal rows per request. Use one for ordinary
+            causal decode. A block reaches a kernel in one of two layouts, and
+            which one this is follows from the shapes: flattened when ``q_len``
+            is 1 and the batch carries ``noncausal_block_size`` rows per
+            request, each with the block-end ``cache_seqlens``; on the query
+            axis when ``q_len`` equals it and the batch, page table and
+            ``cache_seqlens`` carry one entry per request. Ask
+            :func:`supports_mla_decode_query_blocks` before building the
+            second, since not every kernel reads it.
         return_lse: Whether to also return log-sum-exp values.
         out: Optional output tensor with shape [batch, q_len, num_q_heads,
             kv_lora_rank]. When ``value_weight`` is provided, this is required
@@ -1712,6 +1799,17 @@ def mla_decode_with_kvcache(
     """
     if gate is not None and value_weight is None:
         raise ValueError("gate requires value_weight")
+    if window_left < -1:
+        raise ValueError(f"window_left must be -1 or non-negative, got {window_left}")
+    if noncausal_block_size <= 0:
+        raise ValueError(
+            f"noncausal_block_size must be positive, got {noncausal_block_size}"
+        )
+    if 0 <= window_left < noncausal_block_size - 1:
+        raise ValueError(
+            "window_left must cover the complete non-causal block; got "
+            f"window_left={window_left}, block_size={noncausal_block_size}"
+        )
 
     projected_value = value_weight is not None
     if projected_value:
@@ -1744,6 +1842,34 @@ def mla_decode_with_kvcache(
         if return_lse:
             raise ValueError("projected MLA decode does not support return_lse")
 
+    # No windowed kernel fuses the value projection, so compose the windowed
+    # latent decode with the standalone projection. Kernel choice is left to
+    # the ``sliding_window`` trait below rather than pinned here: more than one
+    # implementation applies the mask now.
+    if window_left >= 0 and projected_value:
+        attention = mla_decode_with_kvcache(
+            q=q,
+            kv_cache=kv_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            max_seqlen_k=max_seqlen_k,
+            qk_nope_head_dim=qk_nope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            softmax_scale=softmax_scale,
+            logit_cap=logit_cap,
+            window_left=window_left,
+            noncausal_block_size=noncausal_block_size,
+            override=override,
+            solution=solution,
+        )
+        return mla_project_value(
+            attention.reshape(q.shape[0], q.shape[2], kv_lora_rank),
+            value_weight,
+            gate=gate,
+            out=out,
+        )
+
     traits = {
         "batch_size": q.shape[0],
         "page_size": kv_cache.shape[1],
@@ -1755,6 +1881,15 @@ def mla_decode_with_kvcache(
         "qk_rope_head_dim": qk_rope_head_dim,
         "support_logit_cap": logit_cap != 0.0,
         "return_lse": return_lse,
+        "sliding_window": window_left >= 0,
+        # A proposal block reaches a kernel one of two ways: flattened to one
+        # row per position on the batch axis, or whole on the query axis. A
+        # kernel reads one or the other, never both.
+        "block_on_query_axis": q.shape[1] == noncausal_block_size,
+        # Greater than one only for a block drafter's non-causal proposal, so
+        # a kernel can declare itself for that case without also volunteering
+        # for ordinary decode or target verify.
+        "noncausal_block_size": noncausal_block_size,
     }
     if projected_value:
         traits.update(
@@ -1829,6 +1964,8 @@ def mla_decode_with_kvcache(
         "kv_lora_rank": kv_lora_rank,
         "qk_rope_head_dim": qk_rope_head_dim,
         "max_seqlen_k": max_seqlen_k,
+        "window_left": window_left,
+        "noncausal_block_size": noncausal_block_size,
     }
     if projected_value:
         shape_params["value_head_dim"] = value_weight.shape[2]
@@ -1863,7 +2000,7 @@ def mla_decode_with_kvcache(
                 out=out,
                 logit_cap=logit_cap,
             )
-        return kernel(
+        kernel_kwargs = dict(
             q=q,
             kv_cache=kv_cache,
             page_table=page_table,
@@ -1877,6 +2014,15 @@ def mla_decode_with_kvcache(
             return_lse=return_lse,
             out=out,
         )
+        # Forward the mask arguments only where they carry information, so a
+        # kernel registered for plain decode is never handed a keyword it does
+        # not take. A block of one with no window is plain decode.
+        if window_left >= 0 or noncausal_block_size != 1:
+            kernel_kwargs.update(
+                window_left=window_left,
+                noncausal_block_size=noncausal_block_size,
+            )
+        return kernel(**kernel_kwargs)
 
 
 # ===-----------------------------------------------------------------------===#
@@ -5159,6 +5305,8 @@ def try_kda_fused_paged_verify(
     replay_mixed_qkv: torch.Tensor | None = None,
     replay_gate: torch.Tensor | None = None,
     replay_beta: torch.Tensor | None = None,
+    g_raw: torch.Tensor | None = None,
+    conv_qkv: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
     """Run a registered pre-convolution KDA target-verify fusion when available.
 
@@ -5173,6 +5321,9 @@ def try_kda_fused_paged_verify(
     recurrent_layout = recurrent_layout or kda_recurrent_layout()
     if recurrent_layout not in ("k_major", "v_major"):
         raise ValueError(f"unsupported KDA recurrent layout {recurrent_layout!r}")
+    split_producers = g_raw is not None or conv_qkv is not None
+    if split_producers and (g_raw is None or conv_qkv is None):
+        raise ValueError("g_raw and conv_qkv must be provided together")
     signature = _attention_format_signature(
         q=mixed_qkv,
         k=mixed_qkv,
@@ -5189,6 +5340,7 @@ def try_kda_fused_paged_verify(
                 "recurrent_layout": recurrent_layout,
                 "num_heads": num_heads,
                 "head_dim": head_dim,
+                "split_producers": split_producers,
             },
             solution=solution,
             override=override,
@@ -5197,11 +5349,15 @@ def try_kda_fused_paged_verify(
         return None
     kwargs = {}
     if replay_mixed_qkv is not None:
-        kwargs = {
-            "replay_mixed_qkv": replay_mixed_qkv,
-            "replay_gate": replay_gate,
-            "replay_beta": replay_beta,
-        }
+        kwargs.update(
+            {
+                "replay_mixed_qkv": replay_mixed_qkv,
+                "replay_gate": replay_gate,
+                "replay_beta": replay_beta,
+            }
+        )
+    if split_producers:
+        kwargs.update({"g_raw": g_raw, "conv_qkv": conv_qkv})
     return kernel(
         mixed_qkv=mixed_qkv,
         conv_weights=conv_weights,
@@ -5221,6 +5377,101 @@ def try_kda_fused_paged_verify(
         draft_token_num=draft_token_num,
         lower_bound=lower_bound,
         **kwargs,
+    )
+
+
+def kda_fused_paged_verify_uses_split_producers(
+    dtype: torch.dtype,
+    *,
+    store_states: bool,
+    recurrent_layout: str,
+    num_heads: int,
+    head_dim: int,
+) -> bool:
+    """Whether the selected verify implementation accepts split producers.
+
+    Args:
+        dtype: Activation dtype used to resolve the registered kernel.
+        store_states: Whether verify materializes per-position rollback state.
+        recurrent_layout: Committed recurrent-state layout.
+        num_heads: Per-rank KDA head count.
+        head_dim: KDA head width.
+
+    Returns:
+        True when the selected implementation accepts precomputed convolution
+        and gate tensors.
+    """
+    probe = torch.empty(0, dtype=dtype, device="meta")
+    signature = _attention_format_signature(q=probe, k=probe, v=probe)
+    traits = {
+        "paged_state": True,
+        "store_states": store_states,
+        "recurrent_layout": recurrent_layout,
+    }
+    traits["num_heads"] = num_heads
+    traits["head_dim"] = head_dim
+    try:
+        kernel = select_kernel(
+            "attention", "kda_fused_paged_verify", signature, traits=traits
+        )
+    except NoKernelFoundError:
+        return False
+    registered = KernelRegistry.get().get_by_name(kernel.name)
+    return bool(
+        registered is not None
+        and registered.traits.get("split_producers") == frozenset({True})
+    )
+
+
+def kda_verify_conv_update(
+    mixed_qkv: torch.Tensor,
+    conv_weights: torch.Tensor,
+    conv_states: torch.Tensor,
+    read_indices: torch.Tensor,
+    *,
+    num_heads: int,
+    head_dim: int,
+    draft_token_num: int,
+    recurrent_layout: str,
+) -> torch.Tensor:
+    """Materialize the convolution producer used by split KDA verification.
+
+    Args:
+        mixed_qkv: Packed raw QKV projection rows.
+        conv_weights: Fused four-tap QKV convolution weights.
+        conv_states: Committed convolution-state pool.
+        read_indices: Committed page index for each request.
+        num_heads: Per-rank KDA head count.
+        head_dim: KDA head width.
+        draft_token_num: Verify positions per request.
+        recurrent_layout: Committed recurrent-state layout.
+
+    Returns:
+        Convolved and SiLU-activated QKV rows.
+    """
+    signature = _attention_format_signature(
+        q=mixed_qkv,
+        k=mixed_qkv,
+        v=mixed_qkv,
+    )
+    kernel = select_kernel(
+        "attention",
+        "kda_verify_conv_update",
+        signature,
+        traits={
+            "paged_state": True,
+            "split_producers": True,
+            "recurrent_layout": recurrent_layout,
+        },
+    )
+    return kernel(
+        mixed_qkv=mixed_qkv,
+        conv_weights=conv_weights,
+        conv_states=conv_states,
+        read_indices=read_indices,
+        num_heads=num_heads,
+        head_dim=head_dim,
+        draft_token_num=draft_token_num,
     )
 
 
@@ -5442,6 +5693,98 @@ def kda_replay_commit_supported(
 
 
 # ===-----------------------------------------------------------------------===#
+# QSA Sparse Attention
+# ===-----------------------------------------------------------------------===#
+
+
+def qsa_sparse_attention(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    selected_slots: torch.Tensor,
+    *,
+    scale: float,
+    max_seqlen_q: int,
+    metadata_capacity_rows: int | None,
+    k_scale: float | torch.Tensor | None,
+    v_scale: float | torch.Tensor | None,
+    override: str | None,
+    solution: str | None,
+) -> torch.Tensor:
+    """Attend to a per-query list of physical QSA KV-cache slots.
+
+    Args:
+        q: Query tensor shaped ``[tokens, query_heads, head_dim]``.
+        k_cache: Flattened key cache shaped
+            ``[cache_slots, kv_heads, head_dim]``.
+        v_cache: Flattened value cache shaped
+            ``[cache_slots, kv_heads, value_head_dim]``.
+        selected_slots: Physical cache slots shaped ``[tokens, budget]``;
+            non-positive values are ignored.
+        scale: Softmax scale applied to query-key scores.
+        max_seqlen_q: Number of uniformly packed query tokens per request. This
+            is 1 for normal decode and ``spec_num_tokens`` for compact
+            speculative decode.
+        metadata_capacity_rows: Row capacity reserved by stateful fallback
+            implementations. Pass ``None`` to use the actual query-row count;
+            workspace-free kernels ignore it.
+        k_scale: Optional scalar FP8 key descale.
+        v_scale: Optional scalar FP8 value descale.
+        override: Optional registered kernel name or solution override.
+        solution: Optional kernel solution selected through normal capability
+            and shape filtering.
+
+    Returns:
+        Attention output shaped
+        ``[tokens, query_heads, value_head_dim]`` with the query dtype.
+
+    The SM100 CuTe DSL implementation is preferred when its specialization
+    matches. Other supported NVIDIA architectures use FlashInfer FA2 sparse
+    attention as the registered fallback.
+    """
+
+    if q.ndim != 3 or k_cache.ndim != 3 or v_cache.ndim != 3:
+        raise ValueError("QSA sparse attention expects rank-three Q/K/V tensors")
+    if selected_slots.ndim != 2 or selected_slots.shape[0] != q.shape[0]:
+        raise ValueError("QSA selected slots must have one row per query token")
+    if max_seqlen_q < 1:
+        raise ValueError("QSA max_seqlen_q must be positive")
+    if q.shape[0] % max_seqlen_q:
+        raise ValueError("QSA query rows must be divisible by max_seqlen_q")
+    if q.shape[0] == 0:
+        return q.new_empty((0, q.shape[1], v_cache.shape[-1]))
+    traits = {
+        "batch_size": q.shape[0] // max_seqlen_q,
+        "q_len": max_seqlen_q,
+        "head_dim": q.shape[-1],
+        "value_head_dim": v_cache.shape[-1],
+        "num_q_heads": q.shape[1],
+        "num_kv_heads": k_cache.shape[1],
+        "selected_width": selected_slots.shape[1],
+    }
+    signature = _attention_format_signature(q=q, k_cache=k_cache, v_cache=v_cache)
+    kernel = select_kernel(
+        "attention",
+        "qsa_sparse_attention",
+        signature,
+        traits=traits,
+        solution=solution,
+        override=override,
+    )
+    return kernel(
+        q,
+        k_cache,
+        v_cache,
+        selected_slots,
+        scale=scale,
+        max_seqlen_q=max_seqlen_q,
+        metadata_capacity_rows=metadata_capacity_rows,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+
+
+# ===-----------------------------------------------------------------------===#
 # Attention Utilities
 # ===-----------------------------------------------------------------------===#
 
@@ -5520,12 +5863,14 @@ def attn_merge_state(
 # isort: off
 import tokenspeed_kernel.ops.attention.ascend  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.cuda  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.cute_dsl  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.deep_gemm  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.flash_attn  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.flash_mla  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.flashinfer  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.gluon  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.msa  # noqa: E402,F401
+import tokenspeed_kernel.ops.attention.tokenspeed_mla  # noqa: E402,F401
 import tokenspeed_kernel.ops.attention.triton  # noqa: E402,F401
 
 # isort: on
@@ -5547,6 +5892,7 @@ __all__ = [
     "mla_use_absorbed_extend",
     "mla_extend_with_kvcache",
     "mla_decode_with_kvcache",
+    "supports_mla_decode_query_blocks",
     "dsa_decode",
     "dsa_prefill",
     "dsa_prefill_topk",
@@ -5579,9 +5925,12 @@ __all__ = [
     "kda_paged_decode",
     "try_kda_fused_paged_decode",
     "try_kda_fused_paged_verify",
+    "kda_fused_paged_verify_uses_split_producers",
+    "kda_verify_conv_update",
     "try_kda_replay_commit",
     "resolve_kda_batched_replay_commit",
     "kda_batched_replay_uses_raw_gate",
     "kda_replay_commit_supported",
+    "qsa_sparse_attention",
     "attn_merge_state",
 ]

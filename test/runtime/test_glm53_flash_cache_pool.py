@@ -62,7 +62,7 @@ def test_glm53_flash_pool_binds_paged_cache_and_request_local_tail() -> None:
         num_kv_heads=text_config.num_key_value_heads,
         head_dim=text_config.qk_head_dim,
         attn_tp_size=4,
-        layer_types=tuple(text_config.paged_cache_layer_types),
+        cache_layer_types=tuple(text_config.paged_cache_layer_types),
         kv_lora_rank=text_config.kv_lora_rank,
         qk_nope_head_dim=text_config.qk_nope_head_dim,
         qk_rope_head_dim=text_config.qk_rope_head_dim,
@@ -91,13 +91,12 @@ def test_glm53_flash_pool_binds_paged_cache_and_request_local_tail() -> None:
         prefix_granularity=GLM53_FLASH_LOGICAL_BLOCK_TOKENS,
         context_len=4096,
         max_bs=8,
-        max_graph_bs=8,
         components=(dsa, linear),
     )
     draft_attn_config = replace(
         attn_config,
         is_draft=True,
-        components=(replace(dsa, layer_types=(FULL_ATTENTION,)),),
+        components=(replace(dsa, cache_layer_types=(FULL_ATTENTION,)),),
     )
     groups = declare_glm53_flash_groups(
         text_config.num_hidden_layers,
@@ -170,7 +169,7 @@ def test_glm53_flash_pool_binds_paged_cache_and_request_local_tail() -> None:
         field_layer_offset=4,
     )
 
-    assert pool.num_lcm_blocks == num_lcm_blocks
+    assert pool.arena.plan.num_lcm_blocks == num_lcm_blocks
     assert pool.arena.runtime_contract is not None
     assert pool.arena.runtime_contract.token_capacity == 1024
     assert {
@@ -195,10 +194,8 @@ def test_glm53_flash_pool_binds_paged_cache_and_request_local_tail() -> None:
         contract=pool.arena.runtime_contract,
         num_requests=1,
     )
-    assert metadata.full_attention_group_id == FULL_ATTENTION
-    assert metadata.require_table(
-        FULL_ATTENTION, active_forward_op=forward_op
-    ).shape == (1, 1)
+    tables = metadata.tables(active_forward_op=forward_op)
+    assert tables[FULL_ATTENTION].shape == (1, 1)
     backing_ptr = pool.arena.buffer.untyped_storage().data_ptr()
     dsa_layer = text_config.full_attention_layer_ids[0]
     assert pool.kv_buffer[dsa_layer].untyped_storage().data_ptr() == backing_ptr

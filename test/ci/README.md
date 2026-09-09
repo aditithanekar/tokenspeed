@@ -48,7 +48,7 @@ a score of at least 0.90.
 The Qwen3.8 Flash Next FP8 correctness task runs GSM8K on two GB200 GPUs with
 tensor parallelism 2 and three-step MTP. It keeps KVStore enabled and uses the
 bounded non-thinking chat template for CI stability. The task requires a score
-of at least 0.90.
+of at least 0.96.
 
 Each task expands into one matrix entry per runner label. Add a top-level
 `priority` to a task YAML to bias dispatch order. GitHub Actions starts matrix
@@ -107,6 +107,11 @@ the two directories are created beside that cache instead. This survives
 runner pod recreation and avoids downloading the same large wheels again on
 that node. Other runner families keep their existing cache behavior because
 their cluster storage layouts may differ.
+
+The MI450 simulator launcher sets `TRITON_LIBHIP_PATH` to the ROCm SDK's
+unversioned `libamdhip64.so` linker name. The gfx1250 PyTorch wheel and
+TokenSpeed use separate Triton distributions in the same process, and this
+path is accepted by both while still resolving to the same TheRock runtime.
 
 To enable `push` and `workflow_dispatch` runs of the three PR test workflows
 outside the official repository, set the `TOKENSPEED_CI_REPOSITORY` repository
@@ -194,6 +199,16 @@ By default, the task's top-level `install` stage runs so a runner/base image
 tests the exact committed checkout. Task-specific `eval.install` and
 `perf.install` stages run afterward. Use `--skip-install` only with a release
 image that already contains the intended TokenSpeed build.
+
+The install stage picks up `tokenspeed-mla` from the snapshot only when the
+dispatching workflow sets `INSTALL_TOKENSPEED_MLA_FROM_SOURCE=1`, which the
+per-commit workflow derives from the diff and the manual dispatcher sets for any
+requested pull request. The generated `srun` steps name that variable in
+`--container-env` so it reaches the install stage. Without it the job tests the
+`tokenspeed-mla` wheel pinned in
+`tokenspeed-kernel/python/requirements/cuda-thirdparty.txt`; that pin and the
+in-tree package carry the same version, so pip keeps the wheel and an unreleased
+in-tree kernel change never runs.
 
 The job gets the node exclusively by default so another job cannot contend for
 its GPU or fixed service ports. `--no-exclusive` opts out. Runtime cleanup is

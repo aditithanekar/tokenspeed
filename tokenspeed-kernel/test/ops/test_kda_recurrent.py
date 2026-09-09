@@ -17,6 +17,7 @@ from tokenspeed_kernel.ops.attention import (
     kda_paged_prefill,
     kda_recurrent_layout,
     kda_replay_commit_supported,
+    kda_verify_conv_update,
     try_kda_fused_paged_decode,
     try_kda_fused_paged_verify,
     try_kda_replay_commit,
@@ -173,6 +174,250 @@ def test_kda_verify_split_launch_requires_both_hoists_and_honors_overrides() -> 
     ) == (32, 8, 5)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_glm53_flash_mtp_graph_shape_matches_baseline_and_replays() -> None:
+    """The tuned TP4 graph shape preserves the established kernel output."""
+    from tokenspeed_kernel._triton import triton
+    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+        fused_recurrent_kda_mtp,
+        fused_recurrent_kda_mtp_fwd_kernel,
+    )
+
+    torch.manual_seed(16)
+    dev = "cuda"
+    batch, steps, heads, key_dim, value_dim = 16, 4, 16, 128, 128
+    q = torch.randn(batch, steps, heads, key_dim, dtype=torch.bfloat16, device=dev)
+    k = torch.randn_like(q)
+    v = torch.randn(batch, steps, heads, value_dim, dtype=torch.bfloat16, device=dev)
+    g = torch.randn_like(q)
+    beta = torch.randn(batch, steps, heads, dtype=torch.bfloat16, device=dev)
+    a_log = torch.randn(heads, dtype=torch.float32, device=dev)
+    dt_bias = torch.randn(heads, key_dim, dtype=torch.float32, device=dev)
+    read_indices = torch.arange(batch, dtype=torch.int32, device=dev)
+    write_indices = batch + torch.arange(
+        batch * steps, dtype=torch.int32, device=dev
+    ).view(batch, steps)
+    pages = batch * (steps + 1)
+    initial = torch.randn(
+        batch,
+        heads,
+        value_dim,
+        key_dim,
+        dtype=torch.float32,
+        device=dev,
+    )
+
+    reference_pool = torch.zeros(
+        pages,
+        heads,
+        value_dim,
+        key_dim,
+        dtype=torch.float32,
+        device=dev,
+    )
+    reference_pool[:batch].copy_(initial)
+    reference_output = torch.empty_like(v)
+    grid = triton.cdiv(value_dim, 32) * batch * heads
+    fused_recurrent_kda_mtp_fwd_kernel[(grid,)](
+        q=q,
+        k=k,
+        v=v,
+        g=g,
+        beta=beta,
+        A_log=a_log,
+        dt_bias=dt_bias,
+        o=reference_output,
+        h_pool=reference_pool,
+        h_pool_out=reference_pool,
+        read_indices=read_indices,
+        write_indices=write_indices.reshape(-1),
+        lower_bound=-5.0,
+        stride_q_tok=q.stride(1),
+        stride_k_tok=k.stride(1),
+        stride_v_tok=v.stride(1),
+        stride_g_tok=g.stride(1),
+        stride_beta_tok=beta.stride(1),
+        scale=key_dim**-0.5,
+        N=batch,
+        T=steps,
+        H=heads,
+        HV=heads,
+        K=key_dim,
+        V=value_dim,
+        BK=key_dim,
+        BV=32,
+        stride_state_page=reference_pool.stride(0),
+        stride_state_out_page=reference_pool.stride(0),
+        V_MAJOR=True,
+        USE_QK_L2NORM_IN_KERNEL=True,
+        USE_GATE_IN_KERNEL=True,
+        APPLY_BETA_SIGMOID=True,
+        HAS_DT_BIAS=True,
+        USE_LOWER_BOUND=True,
+        num_warps=4,
+        num_stages=2,
+    )
+
+    tuned_pool = torch.zeros_like(reference_pool)
+    tuned_pool[:batch].copy_(initial)
+
+    def run_tuned() -> torch.Tensor:
+        return fused_recurrent_kda_mtp(
+            q,
+            k,
+            v,
+            g,
+            beta,
+            a_log,
+            dt_bias,
+            tuned_pool,
+            read_indices,
+            write_indices,
+            lower_bound=-5.0,
+            recurrent_layout="v_major",
+        )
+
+    tuned_output = run_tuned()
+    torch.testing.assert_close(
+        tuned_output.float(), reference_output.float(), atol=1e-4, rtol=1e-4
+    )
+    torch.testing.assert_close(
+        tuned_pool[batch:], reference_pool[batch:], atol=1e-4, rtol=1e-4
+    )
+
+    run_tuned()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_output = run_tuned()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    torch.testing.assert_close(graph_output, tuned_output, atol=0, rtol=0)
+    torch.testing.assert_close(
+        tuned_pool[batch:], reference_pool[batch:], atol=1e-4, rtol=1e-4
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
+def test_mtp_direct_committed_read_matches_seeded_scratch_and_replays() -> None:
+    """Separate read/write pools replace the recurrent-state seed exactly."""
+    from tokenspeed_kernel.thirdparty.triton.fla_kda_recurrent import (
+        fused_recurrent_kda_mtp,
+    )
+
+    torch.manual_seed(91)
+    device = "cuda"
+    batch, steps, heads, dim = 3, 4, 4, 128
+    pages = 7
+    row_elements = heads * dim * dim
+    page_stride = row_elements + 37
+    committed_storage = torch.randn(
+        pages * page_stride, dtype=torch.float32, device=device
+    )
+    committed = torch.as_strided(
+        committed_storage,
+        size=(pages, heads, dim, dim),
+        stride=(page_stride, dim * dim, dim, 1),
+    )
+    q = torch.randn(batch, steps, heads, dim, dtype=torch.bfloat16, device=device)
+    k = torch.randn_like(q)
+    v = torch.randn_like(q)
+    gate = torch.randn_like(q)
+    beta = torch.randn(batch, steps, heads, dtype=torch.bfloat16, device=device)
+    a_log = torch.randn(heads, dtype=torch.float32, device=device)
+    dt_bias = torch.randn(heads, dim, dtype=torch.float32, device=device)
+    read_indices = torch.tensor([-1, 4, 1], dtype=torch.int32, device=device)
+    scratch_rows = batch * (steps + 1)
+    bases = torch.arange(batch, dtype=torch.int32, device=device) * (steps + 1)
+    write_indices = bases[:, None] + torch.arange(
+        1, steps + 1, dtype=torch.int32, device=device
+    )
+
+    def run(
+        state_pool: torch.Tensor,
+        initial_rows: torch.Tensor,
+        state_out: torch.Tensor,
+    ) -> torch.Tensor:
+        return fused_recurrent_kda_mtp(
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            a_log,
+            dt_bias,
+            state_pool,
+            initial_rows,
+            write_indices,
+            h_pool_out=state_out,
+            lower_bound=-5.0,
+            recurrent_layout="v_major",
+        )
+
+    def seeded_oracle(indices: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        scratch = torch.full(
+            (scratch_rows, heads, dim, dim),
+            13.0,
+            dtype=torch.float32,
+            device=device,
+        )
+        scratch[bases.long()] = 0
+        valid = indices >= 0
+        scratch[bases[valid].long()] = committed[indices[valid].long()]
+        return run(scratch, bases, scratch), scratch
+
+    expected_out, expected_scratch = seeded_oracle(read_indices)
+    direct_scratch = torch.full_like(expected_scratch, -17.0)
+    committed_before = committed_storage.clone()
+    actual_out = run(committed, read_indices, direct_scratch)
+    torch.cuda.synchronize()
+
+    assert torch.equal(actual_out, expected_out)
+    assert torch.equal(
+        direct_scratch[write_indices.long()],
+        expected_scratch[write_indices.long()],
+    )
+    assert torch.equal(committed_storage, committed_before)
+    assert committed.data_ptr() != direct_scratch.data_ptr()
+
+    accepted = torch.tensor([1, 4, 2], dtype=torch.int64, device=device)
+    destinations = torch.tensor([2, 3, 5], dtype=torch.int64, device=device)
+    expected_committed = committed.clone()
+    actual_committed = committed.clone()
+    rows = bases.long() + accepted
+    expected_committed[destinations] = expected_scratch[rows]
+    actual_committed[destinations] = direct_scratch[rows]
+    assert torch.equal(actual_committed, expected_committed)
+
+    stable_indices = torch.tensor([1, -1, 4], dtype=torch.int32, device=device)
+    graph_scratch = torch.empty_like(direct_scratch)
+    run(committed, stable_indices, graph_scratch)
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_out = run(committed, stable_indices, graph_scratch)
+    graph.replay()
+    torch.cuda.synchronize()
+    first_graph_out = graph_out.clone()
+
+    stable_indices.copy_(torch.tensor([-1, 3, 5], dtype=torch.int32, device=device))
+    committed[3].copy_(torch.randn_like(committed[3]))
+    committed[5].copy_(torch.randn_like(committed[5]))
+    changed_committed = committed_storage.clone()
+    graph.replay()
+    torch.cuda.synchronize()
+
+    replay_expected_out, replay_expected_scratch = seeded_oracle(stable_indices)
+    assert not torch.equal(graph_out, first_graph_out)
+    assert torch.equal(graph_out, replay_expected_out)
+    assert torch.equal(
+        graph_scratch[write_indices.long()],
+        replay_expected_scratch[write_indices.long()],
+    )
+    assert torch.equal(committed_storage, changed_committed)
+
+
 @pytest.mark.parametrize(
     "recurrent_layout,store_states",
     [
@@ -220,8 +465,77 @@ def test_kda_fused_verify_selects_all_layout_traits(
         "recurrent_layout": recurrent_layout,
         "num_heads": 1,
         "head_dim": 1,
+        "split_producers": False,
     }
     assert selected == expected
+
+
+def test_kda_fused_verify_selects_split_producer_kernel_when_inputs_are_given(
+    monkeypatch,
+) -> None:
+    selected = {}
+
+    def fake_select_kernel(*_args, **kwargs):
+        selected.update(kwargs["traits"])
+        return lambda **kernel_kwargs: kernel_kwargs["mixed_qkv"]
+
+    monkeypatch.setattr(attention_ops, "select_kernel", fake_select_kernel)
+    tensor = torch.empty(1, dtype=torch.bfloat16)
+    result = try_kda_fused_paged_verify(
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        state_pool=tensor,
+        state_scratch=tensor,
+        read_indices=tensor,
+        write_indices=tensor,
+        num_heads=1,
+        head_dim=1,
+        draft_token_num=1,
+        recurrent_layout="v_major",
+        store_states=False,
+        g_raw=tensor,
+        conv_qkv=tensor,
+    )
+    assert result is tensor
+    assert selected["split_producers"] is True
+
+
+def test_kda_verify_conv_update_resolves_registered_producer(monkeypatch) -> None:
+    selected = {}
+
+    def fake_select_kernel(*args, **kwargs):
+        selected["operator"] = args[1]
+        selected["traits"] = kwargs["traits"]
+        return lambda **kernel_kwargs: kernel_kwargs["mixed_qkv"]
+
+    monkeypatch.setattr(attention_ops, "select_kernel", fake_select_kernel)
+    tensor = torch.empty(1, dtype=torch.bfloat16)
+    result = kda_verify_conv_update(
+        tensor,
+        tensor,
+        tensor,
+        tensor,
+        num_heads=1,
+        head_dim=1,
+        draft_token_num=1,
+        recurrent_layout="v_major",
+    )
+    assert result is tensor
+    assert selected == {
+        "operator": "kda_verify_conv_update",
+        "traits": {
+            "paged_state": True,
+            "split_producers": True,
+            "recurrent_layout": "v_major",
+        },
+    }
 
 
 @pytest.mark.parametrize(
@@ -284,6 +598,15 @@ def test_kda_replay_is_registered_for_the_platform_layout() -> None:
             {
                 "paged_state": frozenset({True}),
                 "store_states": frozenset({True}),
+                "split_producers": frozenset({False}),
+                "recurrent_layout": frozenset({"v_major"}),
+            },
+        ),
+        (
+            "triton_nvidia_kda_verify_conv_update",
+            {
+                "paged_state": frozenset({True}),
+                "split_producers": frozenset({True}),
                 "recurrent_layout": frozenset({"v_major"}),
             },
         ),
@@ -292,6 +615,7 @@ def test_kda_replay_is_registered_for_the_platform_layout() -> None:
             {
                 "paged_state": frozenset({True}),
                 "store_states": frozenset({False}),
+                "split_producers": frozenset({False}),
                 "recurrent_layout": frozenset({"v_major"}),
             },
         ),
@@ -400,6 +724,7 @@ def test_kda_split_verify_registration_traits() -> None:
     assert spec.traits == {
         "paged_state": frozenset({True}),
         "store_states": frozenset({False}),
+        "split_producers": frozenset({True}),
         "recurrent_layout": frozenset({"v_major"}),
     }
 
@@ -1109,6 +1434,7 @@ def _run_megafuse(inp, *, fused: bool):
         NORM_EPS,
         heads,
         head_dim,
+        enable_pdl=False,
     ).view_as(out)
 
 

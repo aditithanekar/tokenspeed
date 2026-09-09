@@ -108,20 +108,36 @@ def _swiglu_split_layout(
     )
 
 
+@gluon.constexpr_function
+def _mxfp4_swiglu_split_layout(
+    block_m: int, block_n_full: int, num_warps: int
+) -> gl.constexpr:
+    # Match the post-split tile to scaled_downcast_layout(). The interleaved
+    # accumulator holds two adjacent values for each output, so its contiguous
+    # register extent is twice the downcast extent.
+    out_block_n = block_n_full // 2
+    out_per_thread = min(16, out_block_n)
+    lanes_n = max(1, min(8, out_block_n // out_per_thread))
+    lanes_m = 64 // lanes_n
+    warps_m = max(1, min(num_warps, block_m // lanes_m))
+    return gl.BlockedLayout(
+        size_per_thread=[1, 2 * out_per_thread],
+        threads_per_warp=[lanes_m, lanes_n],
+        warps_per_cta=[warps_m, num_warps // warps_m],
+        order=[1, 0],
+    )
+
+
 @gluon.jit
-def _swiglu_reduce(
+def _swiglu_reduce_with_layout(
     acc,
     alpha: gl.constexpr,
     limit: gl.constexpr,
     beta: gl.constexpr,
     OUT_BLOCK_N: gl.constexpr,
-    MMA: gl.constexpr,
+    SPLIT_LAYOUT: gl.constexpr,
 ):
     BLOCK_M: gl.constexpr = acc.shape[0]
-    BLOCK_N_FULL: gl.constexpr = acc.shape[1]
-    SPLIT_LAYOUT: gl.constexpr = _swiglu_split_layout(
-        BLOCK_M, BLOCK_N_FULL, gl.num_warps()
-    )
     acc = gl.convert_layout(acc, SPLIT_LAYOUT)
     reshaped = acc.reshape((BLOCK_M, OUT_BLOCK_N, 2))
     gate, linear = gl.split(reshaped)
@@ -130,6 +146,38 @@ def _swiglu_reduce(
         linear = gl.clamp(linear, -limit, limit)
     s = gate / (1.0 + gl.exp(-alpha * gate))
     return s * (linear + beta)
+
+
+@gluon.jit
+def _swiglu_reduce(
+    acc,
+    alpha: gl.constexpr,
+    limit: gl.constexpr,
+    beta: gl.constexpr,
+    OUT_BLOCK_N: gl.constexpr,
+):
+    SPLIT_LAYOUT: gl.constexpr = _swiglu_split_layout(
+        acc.shape[0], acc.shape[1], gl.num_warps()
+    )
+    return _swiglu_reduce_with_layout(
+        acc, alpha, limit, beta, OUT_BLOCK_N, SPLIT_LAYOUT
+    )
+
+
+@gluon.jit
+def _mxfp4_swiglu_reduce(
+    acc,
+    alpha: gl.constexpr,
+    limit: gl.constexpr,
+    beta: gl.constexpr,
+    OUT_BLOCK_N: gl.constexpr,
+):
+    SPLIT_LAYOUT: gl.constexpr = _mxfp4_swiglu_split_layout(
+        acc.shape[0], acc.shape[1], gl.num_warps()
+    )
+    return _swiglu_reduce_with_layout(
+        acc, alpha, limit, beta, OUT_BLOCK_N, SPLIT_LAYOUT
+    )
 
 
 @gluon.jit
@@ -193,28 +241,6 @@ def get_mfma_layout(
 
 
 @gluon.constexpr_function
-def get_bitwidth(dtype):
-    if isinstance(dtype, gl.pointer_type):
-        dtype = dtype.element_ty
-    return dtype.primitive_bitwidth
-
-
-@gluon.constexpr_function
-def get_blocked_layout(num_warps: gl.constexpr, dtype: gl.constexpr, order):
-    bitwidth = get_bitwidth(dtype)
-    vector_size = (
-        [1, max(1, 128 // bitwidth)] if order[1] == 0 else [max(1, 128 // bitwidth), 1]
-    )
-    warps_per_cta = [num_warps // 2, 2] if order[1] == 0 else [2, num_warps // 2]
-    return gl.BlockedLayout(vector_size, [8, 8], warps_per_cta, order)
-
-
-@gluon.constexpr_function
-def get_scale_blocked_layout(num_warps: gl.constexpr):
-    return gl.BlockedLayout([1, 8], [1, 64], [num_warps // 2, 2], [1, 0])
-
-
-@gluon.constexpr_function
 def _scale_async_blocked_layout(
     BLOCK_NONK_PS: gl.constexpr, BLOCK_K_PS: gl.constexpr, NUM_WARPS: gl.constexpr
 ):
@@ -260,26 +286,6 @@ def _group_m_swizzle(
         pid_m = group_id * GROUP_M + (intra % group_size)
         pid_n = intra // group_size
     return pid_m, pid_n
-
-
-@gluon.jit
-def _mxfp4_scale_offset(n_idx, k_scale_idx, stride_wsk, stride_wsn):
-    """Byte offset into a CDNA4-swizzled MXFP4 scale tensor.
-
-    Storage is (..., K_SCALE_PAD*32, N_PAD/32); the swizzle packs the 32-wide N
-    block and the K-scale position into one linear axis.
-    """
-    row = n_idx.to(gl.uint32)
-    # CDNA4 e8m0 swizzle: K-scale group stride 256, (k%4) stride 64. Using
-    # 128/32 would alias K-scale offsets with the N-part (wrong scale read).
-    lin = (
-        (k_scale_idx // 8) * 256
-        + (k_scale_idx % 4) * 64
-        + (row % 16) * 4
-        + ((k_scale_idx % 8) // 4) * 2
-        + ((row % 32) // 16)
-    )
-    return (row // 32).to(gl.int64) * stride_wsn + lin.to(gl.int64) * stride_wsk
 
 
 @gluon.jit
@@ -449,9 +455,3 @@ def _moe_partial_reduce_shared(
             SharedOut + shared_token * stride_som + shared_n * stride_son,
             shared_acc.to(SharedOut.dtype.element_ty),
         )
-
-
-def _route_small_m(logits, topk, dtype):
-    """1-kernel stable-order fused route for bounded M and G=M*topk."""
-    M, E = logits.shape
-    G = M * topk

@@ -16,7 +16,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Literal
 
@@ -35,15 +35,18 @@ SlidingWindowTokens = int | Sequence[int | None] | None
 class CacheGroupSpec:
     """One cache group's scheduler-facing layout.
 
-    A spec declares exactly one geometry shape:
+    A spec declares exactly one geometry shape, and the family names it:
 
-    * **Row geometry** (``rows_per_page`` + ``entry_stride_tokens``) — for
-      paged KV-cache consumers, whose CacheBlocks physically hold rows of
-      entries (per-token KV, sliding windows, compressed entries).
-    * **Checkpoint** (``checkpoint_granularity``) — for snapshot-style state
-      groups (recurrent/conv state), whose CacheBlocks each hold one state
-      snapshot taken every ``checkpoint_granularity`` tokens. Such a group
-      has no rows and no pages; only state-family groups may use this shape.
+    * **Row geometry** (``rows_per_page`` + ``entry_stride_tokens``) — the
+      ``"history"`` family: paged KV-cache consumers whose CacheBlocks
+      physically hold rows of entries (per-token KV, sliding windows,
+      compressed entries). Retention is full-history or sliding.
+    * **Checkpoint** (``checkpoint_granularity``) — the ``"state"`` family:
+      snapshot-style groups (recurrent/conv state) whose CacheBlocks each
+      hold one state snapshot taken every ``checkpoint_granularity`` tokens.
+      Such a group has no rows and no pages, and a snapshot summarizes
+      everything before it, so nothing in it ever slides out: retention is
+      always full-history.
 
     Family-agnostic consumers address either shape through
     ``block_granularity``; ``page_size`` exists only for row geometry.
@@ -54,8 +57,8 @@ class CacheGroupSpec:
     rows_per_page: int | None = None
     entry_stride_tokens: int | None = None
     sliding_window_tokens: int | None = None
-    # History stores token history; State stores recurrent state. Retention
-    # determines whether either family is full-history or sliding.
+    # History stores token history in rows; State stores recurrent-state
+    # checkpoints. __post_init__ holds the family to its shape.
     family: Family = "history"
     # None preserves standalone/non-PD behavior; PD plans set this explicitly.
     transfer_policy: TransferPolicy | None = None
@@ -82,7 +85,18 @@ class CacheGroupSpec:
                     f"group {self.group_id!r}: checkpoint_granularity must be "
                     f"> 0, got {self.checkpoint_granularity}"
                 )
+            if self.retention != "full_history":
+                raise ValueError(
+                    f"group {self.group_id!r}: a state group keeps checkpoints "
+                    "that never slide out; declare full_history retention"
+                )
             return
+        if self.family == "state":
+            raise ValueError(
+                f"group {self.group_id!r}: a state-family group declares "
+                "checkpoint_granularity; rows of token history -- a sliding "
+                "window included -- are a history-family group"
+            )
         if self.rows_per_page is None or self.entry_stride_tokens is None:
             raise ValueError(
                 f"group {self.group_id!r}: declare either row geometry "
@@ -115,7 +129,13 @@ class CacheGroupSpec:
         return self.page_size
 
 
-_CACHE_GROUP_DUMMY_PAGES = 1
+# One declared cache group: what the scheduler is told, and the bytes it costs.
+CacheGroupDeclaration = tuple[CacheGroupSpec, tuple[plan.CacheFieldSpec, ...]]
+
+# Every group's page 0 is the reserved null page (padding rows, holes and
+# failed slots resolve to it); recipes subtract it again when they count
+# allocatable children per LCM parent.
+NULL_PAGES = 1
 
 # The scale-tile span lives with the field geometry it defines (plan.py); it is
 # re-exported here because scheduler-side callers reason about the tile as a
@@ -132,7 +152,8 @@ def _ceil_div(dividend: int, divisor: int) -> int:
 FULL_ATTENTION = "full_attention"
 LINEAR_ATTENTION = "linear_attention"
 
-# Labels whose group is state-family (recurrent state rows, not KV history).
+# Labels whose group is state-family (recurrent-state checkpoints, not rows
+# of KV history).
 STATE_LAYER_TYPES = frozenset({LINEAR_ATTENTION})
 
 
@@ -152,20 +173,12 @@ def validate_scheduler_config(
             required families.
 
     Raises:
-        RuntimeError: When the pool publishes no runtime contract, or when a
-            contract family (e.g. a hybrid pool's ``state`` group) has no
-            consumer in the backend — that group's tables would go unread,
-            dying on a capture-path assert at best and silently reading the
-            wrong pages at worst.
+        RuntimeError: When a contract family (e.g. a hybrid pool's ``state``
+            group) has no consumer in the backend — that group's tables would
+            go unread, dying on a capture-path assert at best and silently
+            reading the wrong pages at worst.
     """
-    arena = getattr(kv_pool, "arena", None)
-    contract = getattr(arena, "runtime_contract", None)
-    if contract is None:
-        raise RuntimeError(
-            f"KV pool {type(kv_pool).__name__} publishes no "
-            "CacheRuntimeContract. Every pool must be built from a "
-            "cache recipe (kv_cache.recipes.setup.prepare_cache_setup)."
-        )
+    contract = kv_pool.arena.runtime_contract
     required_families = frozenset(spec.family for spec in contract.group_specs)
     supported_families = frozenset(getattr(attn_backend, "cache_consumer_families", ()))
     missing_families = required_families - supported_families
@@ -187,7 +200,6 @@ def compute_cache_group_page_counts(
     max_context_len: int,
     decode_input_tokens: int = 1,
     overlap_schedule_depth: int = 0,
-    safety_margin: int = 0,
 ) -> dict[str, int]:
     if max_live_requests < 0:
         raise ValueError(f"max_live_requests must be >= 0, got {max_live_requests}")
@@ -207,8 +219,6 @@ def compute_cache_group_page_counts(
         )
     if overlap_schedule_depth > 0 and decode_input_tokens == 0:
         raise ValueError("overlapped cache sizing requires decode_input_tokens > 0")
-    if safety_margin < 0:
-        raise ValueError(f"safety_margin must be >= 0, got {safety_margin}")
 
     counts: dict[str, int] = {}
     for spec in specs:
@@ -216,20 +226,13 @@ def compute_cache_group_page_counts(
         protected_pages = max_live_requests * _ceil_div(
             overlap_schedule_depth * decode_input_tokens, block_granularity
         )
-        # Mamba-state kind = family "state" AND retention != sliding_window
-        # (the C++ side keys it the same way); V4's sliding-window state tail
-        # buffers keep the sliding-window formula below.
-        if spec.family == "state" and spec.retention == "full_history":
-            total = max_live_requests * 2 + _CACHE_GROUP_DUMMY_PAGES + safety_margin
+        # A state group holds two rolling checkpoints per request (input and
+        # output), whatever the prompt or chunk width.
+        if spec.family == "state":
+            total = max_live_requests * 2 + NULL_PAGES
         elif spec.retention == "full_history":
             full_pages = _ceil_div(max_total_tokens, block_granularity)
-            total = (
-                full_pages
-                + max_live_requests
-                + protected_pages
-                + _CACHE_GROUP_DUMMY_PAGES
-                + safety_margin
-            )
+            total = full_pages + max_live_requests + protected_pages + NULL_PAGES
         elif spec.retention == "sliding_window":
             window = spec.sliding_window_tokens
             if window is None or window <= 0:
@@ -249,8 +252,7 @@ def compute_cache_group_page_counts(
                 + scheduled_pages
                 + max_live_requests
                 + protected_pages
-                + _CACHE_GROUP_DUMMY_PAGES
-                + safety_margin
+                + NULL_PAGES
             )
         else:
             raise ValueError(
@@ -325,8 +327,7 @@ def compute_max_logical_pages_for_capture(
 _LAYER_TYPE_RETENTION: dict[str, Retention] = {
     FULL_ATTENTION: "full_history",
     "sliding_attention": "sliding_window",
-    # State groups ride full_history retention: the C++ side keys the
-    # mamba-state kind on family == State && retention != SlidingWindow.
+    # State groups ride full_history retention: a checkpoint never slides out.
     LINEAR_ATTENTION: "full_history",
     # DSA attends sparsely but retains the full KV history (the indexer
     # selects from it), so its layers publish as full-history groups.
@@ -410,11 +411,12 @@ def hybrid_slab_group_size(
     """Slab count for the hybrid slab KV layout (the i-th layer of EACH
     group shares slab i), or None when the model cannot share slabs.
 
-    Single source (canonical) for both the sizing divisor (registry KV
-    profile) and the planned field layout -- the two must never disagree. The scheduler's single BlockPool owns each page id by at most
-    one group, so paired layers' live rows never overlap. Unknown labels
-    degrade to None -- the predicate gates an optimization, so it must not
-    raise.
+    This is the sizing divisor the ordinary recipe turns profiled bytes per
+    token into parents with; the planned field layout pairs layers the same
+    way through ``group``'s per-group occurrence counter. The scheduler's
+    single BlockPool owns each page id by at most one group, so paired
+    layers' live rows never overlap. Unknown labels degrade to None -- the
+    predicate gates an optimization, so it must not raise.
 
     Groups may be unequal in size (e.g. Inkling's 55 sliding + 11 full):
     the slab count is the LARGEST group's layer count; slabs beyond a
@@ -499,11 +501,10 @@ def layer_group_ids(
     layer_types: Sequence[str],
     sliding_window_tokens: SlidingWindowTokens,
 ) -> list[str]:
-    """Per-layer cache group id — the single derivation the recipes
-    and multi-window models assign ``PagedAttention(group_id=...)`` from
-    (today gpt_oss.py assigns group_id=layer_type, identical in the
-    single-window case), so ``block_tables`` keys line up with the
-    published group specs.
+    """Per-layer cache group id, derived once from the storage labels; the
+    model side never spells these (``bind_cache_groups`` stamps each
+    ``PagedAttention`` from the plan), so ``block_tables`` keys line up with
+    the published group specs by construction.
 
     The id is the bare label unless sliding layers carry more than one
     distinct window (then ``label_<window>``), so single-window models keep
@@ -542,14 +543,13 @@ def split_recurrent_state_groups(layer_types: Sequence[str]) -> list[str]:
 
 def group(
     *,
-    layer_types: Sequence[str],
-    group_ids: Sequence[str],
+    layer_types: Sequence[str],  # len: num_layers
+    group_ids: Sequence[str],  # len: num_layers
     sliding_window_tokens: SlidingWindowTokens,
     prefix_granularity: int,
     fields_for_layer,
-    page_sizes: Mapping[str, int] | None = None,
     pd_disaggregation_enabled: bool = False,
-) -> tuple[tuple[CacheGroupSpec, tuple], ...]:
+) -> tuple[CacheGroupDeclaration, ...]:
     """Walk the layers once, building each group whole.
 
     A cache group has two halves -- the scheduler-facing spec and the bytes
@@ -569,8 +569,8 @@ def group(
         layer_types: Per-layer labels: "full_attention" / "sliding_attention"
             (or sliding sub-group labels "sliding_attention_<k>") /
             "linear_attention" (state-family, e.g. Qwen3.5 GDN). Retention
-            and family always come from these labels. Empty means every layer
-            is full-history.
+            and family always come from these labels; the recipe resolves
+            one label per layer (CacheRecipe.layer_types).
         group_ids: Physical group id per layer. The cache recipe is the
             single source of these ids: derive them with ``layer_group_ids``
             for label-equivalent grouping, or supply a finer split (hybrid
@@ -579,14 +579,12 @@ def group(
         sliding_window_tokens: One window for all sliding layers (today's HF
             scalar), or a per-layer sequence (multi-window models; full-layer
             positions must be None).
-        prefix_granularity: Scheduler-wide prefix granularity in tokens.
+        prefix_granularity: Scheduler-wide prefix granularity in tokens; every
+            group's CacheBlock spans it.
         fields_for_layer: ``(layer_id, group_id, occurrence) -> fields``. The
             occurrence is how many layers of this group already declared
             fields, i.e. this layer's slot in the group's plane numbering; a
             layer that declares nothing does not consume a slot.
-        page_sizes: Per-group page sizes keyed by group id (heterogeneous
-            block sizes); values must be positive multiples of
-            prefix_granularity. Groups not listed use prefix_granularity.
         pd_disaggregation_enabled: Stamp PD transfer policies on the specs.
 
     Returns:
@@ -606,21 +604,12 @@ def group(
             "cache recipe is their single source: derive them with "
             "layer_group_ids(...)"
         )
-    resolved_layer_types = tuple(layer_types) or (FULL_ATTENTION,) * len(
-        resolved_group_ids
-    )
+    resolved_layer_types = tuple(layer_types)
     if len(resolved_group_ids) != len(resolved_layer_types):
         raise ValueError(
             f"group_ids has {len(resolved_group_ids)} entries but layer_types "
             f"has {len(resolved_layer_types)}"
         )
-    sizes = dict(page_sizes or {})
-    for gid, ps in sizes.items():
-        if ps <= 0 or ps % prefix_granularity:
-            raise ValueError(
-                f"page_sizes[{gid!r}] = {ps} must be a positive "
-                f"multiple of prefix_granularity {prefix_granularity}"
-            )
     layer_policies = _layer_retention_windows(
         resolved_layer_types, sliding_window_tokens
     )
@@ -631,8 +620,6 @@ def group(
     for layer_id, ((retention, window), gid) in enumerate(
         zip(layer_policies, resolved_group_ids)
     ):
-        if not gid:
-            raise ValueError(f"group_ids[{layer_id}] must be non-empty")
         family: Family = (
             "state"
             if resolved_layer_types[layer_id] in STATE_LAYER_TYPES
@@ -656,15 +643,14 @@ def group(
                 retention=retention,
                 window=window,
                 family=family,
-                block_tokens=sizes.pop(gid, None) or prefix_granularity,
+                block_tokens=prefix_granularity,
             )
+
         occurrence = occurrences.get(gid, 0)
         declared = tuple(fields_for_layer(layer_id, gid, occurrence))
         if declared:
             occurrences[gid] = occurrence + 1
             fields[gid] = fields.get(gid, ()) + declared
-    if sizes:
-        raise ValueError(f"page_sizes for unknown groups: {sorted(sizes)}")
     barren = sorted(set(specs) - set(fields))
     if barren:
         raise ValueError(
@@ -711,9 +697,8 @@ def apply_pd_transfer_policies(
 ) -> list[CacheGroupSpec]:
     """Stamp PD-disaggregation transfer policies onto group specs.
 
-    Full-history state groups transfer only their trailing snapshot. Sliding
-    state is rolling token history and therefore transfers its complete
-    retained suffix, like an attention-history group.
+    State groups transfer only their trailing checkpoint; history groups --
+    a sliding window included -- transfer their complete retained suffix.
     """
     from dataclasses import replace
 
@@ -721,9 +706,7 @@ def apply_pd_transfer_policies(
         replace(
             spec,
             transfer_policy=(
-                "latest_snapshot"
-                if spec.family == "state" and spec.retention == "full_history"
-                else "full_suffix"
+                "latest_snapshot" if spec.family == "state" else "full_suffix"
             ),
         )
         for spec in specs

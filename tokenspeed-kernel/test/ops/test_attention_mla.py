@@ -9,6 +9,7 @@ from tokenspeed_kernel import (
     mla_decode_with_kvcache,
     mla_extend_with_kvcache,
     mla_prefill,
+    supports_mla_decode_query_blocks,
 )
 from tokenspeed_kernel.platform import current_platform
 
@@ -417,6 +418,86 @@ def test_mla_decode_with_kvcache(
     out_tol = 1e-1 if q_dtype in _FP8_DTYPES or kv_dtype in _FP8_DTYPES else 8e-2
     torch.testing.assert_close(out.float(), out_ref, rtol=out_tol, atol=out_tol)
     torch.testing.assert_close(lse, lse_ref, rtol=8e-2, atol=8e-2)
+
+
+def test_mla_decode_noncausal_block_sliding_window_matches_reference_and_captures(
+    device: str,
+) -> None:
+    torch.manual_seed(91)
+    block_size = 8
+    context_len = 177
+    cache_len = context_len + block_size
+    window_left = 129
+    page_size = 64
+    num_heads = 2
+    kv_lora_rank = 8
+    qk_rope_head_dim = 4
+    qk_nope_head_dim = 4
+    qk_head_dim = kv_lora_rank + qk_rope_head_dim
+    max_pages = math.ceil(cache_len / page_size)
+
+    q = torch.randn(
+        block_size,
+        1,
+        num_heads,
+        qk_head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    kv_cache = torch.randn(
+        max_pages,
+        page_size,
+        1,
+        qk_head_dim,
+        device=device,
+        dtype=torch.bfloat16,
+    )
+    page_table = torch.arange(max_pages, device=device, dtype=torch.int32).repeat(
+        block_size, 1
+    )
+    cache_seqlens = torch.full(
+        (block_size,), cache_len, device=device, dtype=torch.int32
+    )
+    softmax_scale = 1.0 / math.sqrt(qk_head_dim)
+
+    def run(query: torch.Tensor) -> torch.Tensor:
+        return mla_decode_with_kvcache(
+            q=query,
+            kv_cache=kv_cache,
+            page_table=page_table,
+            cache_seqlens=cache_seqlens,
+            max_seqlen_k=cache_len,
+            qk_nope_head_dim=qk_nope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            softmax_scale=softmax_scale,
+            window_left=window_left,
+            noncausal_block_size=block_size,
+        )
+
+    output = run(q)
+    dense_kv = kv_cache.reshape(-1, qk_head_dim)[:cache_len].float()
+    expected = []
+    for block_position in range(block_size):
+        start = max(
+            0,
+            context_len - window_left + block_position,
+        )
+        visible = dense_kv[start:cache_len]
+        scores = torch.einsum("hd,kd->hk", q[block_position, 0].float(), visible)
+        probs = torch.softmax(scores * softmax_scale, dim=-1)
+        expected.append(torch.matmul(probs, visible[:, :kv_lora_rank]))
+    expected_output = torch.stack(expected).unsqueeze(1)
+    torch.testing.assert_close(output.float(), expected_output, rtol=8e-2, atol=8e-2)
+
+    graph_output = torch.empty_like(output)
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        graph_output.copy_(run(q))
+    eager_output = output.clone()
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(graph_output, eager_output, atol=0, rtol=0)
 
 
 @pytest.mark.parametrize(
@@ -1176,3 +1257,108 @@ def test_gfx950_k3_decode_split_policy() -> None:
         )
         == 128
     )
+
+
+# Real MLA widths: the fast windowed kernel is registered for these alone.
+_QUERY_BLOCK_DIMS = dict(kv_lora_rank=512, qk_rope_head_dim=64, qk_nope_head_dim=128)
+
+
+def _windowed_decode(q, kv_cache, page_table, cache_seqlens, cache_len, window, block):
+    return mla_decode_with_kvcache(
+        q=q,
+        kv_cache=kv_cache,
+        page_table=page_table,
+        cache_seqlens=cache_seqlens,
+        max_seqlen_k=cache_len,
+        softmax_scale=(_QUERY_BLOCK_DIMS["kv_lora_rank"] + 64) ** -0.5,
+        window_left=window,
+        noncausal_block_size=block,
+        **_QUERY_BLOCK_DIMS,
+    )
+
+
+@pytest.mark.skipif(
+    not (torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 10),
+    reason="the query-axis block MLA decode is a Blackwell CuteDSL kernel",
+)
+@pytest.mark.parametrize("window", [129, -1], ids=["windowed", "full-attention"])
+def test_mla_block_decode_agrees_across_both_block_layouts(
+    device: str, window: int
+) -> None:
+    """One flattened row per block position, or the block on the query axis.
+
+    The two spell the same mask and dispatch to different kernels, so agreeing
+    is what makes the layout a caller's choice rather than a semantic one. A
+    draft mixes windowed and full-attention layers, so both masks have to hold.
+    """
+    torch.manual_seed(91)
+    block, context_len, page_size, heads = 8, 177, 64, 8
+    cache_len = context_len + block
+    qk_head_dim = (
+        _QUERY_BLOCK_DIMS["kv_lora_rank"] + _QUERY_BLOCK_DIMS["qk_rope_head_dim"]
+    )
+    pages = math.ceil(cache_len / page_size)
+
+    assert supports_mla_decode_query_blocks(
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        page_size=page_size,
+        num_q_heads=heads,
+        q_len=block,
+        kv_lora_rank=_QUERY_BLOCK_DIMS["kv_lora_rank"],
+        qk_rope_head_dim=_QUERY_BLOCK_DIMS["qk_rope_head_dim"],
+        sliding_window=window >= 0,
+    )
+
+    q = torch.randn(block, heads, qk_head_dim, device=device, dtype=torch.bfloat16) / 8
+    kv_cache = (
+        torch.randn(
+            pages, page_size, 1, qk_head_dim, device=device, dtype=torch.bfloat16
+        )
+        / 8
+    )
+    table = torch.arange(pages, device=device, dtype=torch.int32)
+    lens = torch.full((1,), cache_len, device=device, dtype=torch.int32)
+
+    flattened = _windowed_decode(
+        q.unsqueeze(1),
+        kv_cache,
+        table.repeat(block, 1),
+        lens.repeat(block),
+        cache_len,
+        window,
+        block,
+    )
+    query_axis = _windowed_decode(
+        q.unsqueeze(0),
+        kv_cache,
+        table.unsqueeze(0),
+        lens,
+        cache_len,
+        window,
+        block,
+    )
+    torch.testing.assert_close(
+        query_axis.reshape(block, heads, -1).float(),
+        flattened.reshape(block, heads, -1).float(),
+        rtol=2e-2,
+        atol=2e-2,
+    )
+
+
+def test_query_block_support_declines_what_the_fast_kernel_never_declared() -> None:
+    """A caller that gets False keeps the flattened form the portable kernel reads."""
+    probe = dict(
+        q_dtype=torch.bfloat16,
+        kv_dtype=torch.bfloat16,
+        page_size=64,
+        num_q_heads=8,
+        q_len=8,
+        sliding_window=True,
+        **{k: v for k, v in _QUERY_BLOCK_DIMS.items() if k != "qk_nope_head_dim"},
+    )
+    assert not supports_mla_decode_query_blocks(**{**probe, "page_size": 128})
+    assert not supports_mla_decode_query_blocks(**{**probe, "kv_lora_rank": 8})
+    assert not supports_mla_decode_query_blocks(**{**probe, "solution": "triton"})
+    # A block of one is ordinary decode or target verify, never a proposal.
+    assert not supports_mla_decode_query_blocks(**{**probe, "q_len": 1})
