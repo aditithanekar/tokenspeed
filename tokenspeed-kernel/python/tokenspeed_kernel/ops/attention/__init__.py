@@ -1024,7 +1024,7 @@ def mla_project_value(
         "inputs_contiguous": (
             attention.is_contiguous()
             and weight.is_contiguous()
-            and (gate is None or gate.is_contiguous())
+            and (gate is None or gate.stride(-1) == 1)
             and out.is_contiguous()
         ),
     }
@@ -1308,8 +1308,6 @@ def mla_normalize_project_query(
         else:
             from tokenspeed_kernel.ops.layernorm.cuda import rmsnorm_fused_parallel
 
-        from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv
-
         query_norm = torch.empty_like(query)
         rmsnorm_fused_parallel(
             input1=query,
@@ -1320,7 +1318,24 @@ def mla_normalize_project_query(
             output2=kv,
             eps=eps,
         )
-        decode_gemv(query_norm, projection_weight, out=projection_out)
+        if current_platform().is_cdna5 and tokens > 1:
+            from tokenspeed_kernel.ops.gemm.kimi3 import _try_gluon_largem_gfx1250
+
+            if (
+                _try_gluon_largem_gfx1250(
+                    query_norm,
+                    projection_weight,
+                    out=projection_out,
+                )
+                is None
+            ):
+                from tokenspeed_kernel.ops.gemm import mm
+
+                mm(query_norm, projection_weight, out=projection_out)
+        else:
+            from tokenspeed_kernel.ops.gemm.triton_gemv import decode_gemv
+
+            decode_gemv(query_norm, projection_weight, out=projection_out)
     else:
         query_fp32 = query.float()
         query_norm = query_fp32 * torch.rsqrt(
@@ -3534,6 +3549,8 @@ def dsv4_swa_cache_insert(
     q_out: torch.Tensor | None = None,
     override: str | None = None,
     solution: str | None = None,
+    *,
+    validate_positions: bool,
 ) -> None:
     """Normalize/rotate Q and rotate/quantize/insert DeepSeek V4 SWA K/V.
 
@@ -3552,6 +3569,9 @@ def dsv4_swa_cache_insert(
             When provided, ``q`` is left unchanged.
         override: Optional exact registered kernel name.
         solution: Optional registered solution name.
+        validate_positions: Check that every position indexes ``cos_sin_cache``.
+            Runtime integrations may disable this only after validating the same
+            positions once for an equal cache capacity in the current forward.
 
     Returns:
         None. Q and the selected cache rows are written in place.
@@ -3598,13 +3618,16 @@ def dsv4_swa_cache_insert(
     tensors = (kv, swa_kv_cache, slot_mapping, positions, cos_sin_cache)
     if any(tensor.device != q.device for tensor in tensors):
         raise ValueError("all DeepSeek V4 SWA cache tensors must share a device")
-    positions_valid = ((positions >= 0) & (positions < cos_sin_cache.shape[0])).all()
-    position_error = "positions entries must index cos_sin_cache"
-    if positions.device.type == "cpu":
-        if not bool(positions_valid.item()):
-            raise ValueError(position_error)
-    else:
-        torch._assert_async(positions_valid, position_error)
+    if validate_positions:
+        positions_valid = (
+            (positions >= 0) & (positions < cos_sin_cache.shape[0])
+        ).all()
+        position_error = "positions entries must index cos_sin_cache"
+        if positions.device.type == "cpu":
+            if not bool(positions_valid.item()):
+                raise ValueError(position_error)
+        else:
+            torch._assert_async(positions_valid, position_error)
     if q_out is not None and (
         q_out.shape != q.shape
         or q_out.dtype != q.dtype
@@ -4699,6 +4722,8 @@ def gdn_decode_mtp(
 
     Returns:
         Decode output shaped ``[B, T, num_v_heads, head_v_dim]`` (q.dtype).
+        Outputs for negative initial-state indices are undefined and must be
+        ignored, including on the FlashInfer FP32 path.
     """
     if output_state_indices is not None:
         if output_state_indices.shape != q.shape[:2]:
