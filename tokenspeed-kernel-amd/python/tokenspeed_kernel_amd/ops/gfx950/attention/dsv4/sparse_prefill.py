@@ -31,8 +31,8 @@ validated DeepSeek-V4 prefill shapes: B=1, D=512, H in {64, 128}, topk>=128.
 from __future__ import annotations
 
 import torch
+from tokenspeed_kernel_amd._triton import cdna4_async_copy as cdna4_async
 from tokenspeed_kernel_amd._triton import (
-    cdna4_async_copy as cdna4_async,
     gl,
     gluon,
     tl,
@@ -46,13 +46,27 @@ __all__ = ["gluon_dsv4_sparse_prefill_gfx950"]
 # pipeline (MIT) with TokenSpeed ABI, lens, masking, and BLOCK_K=32 support.
 @gluon.jit
 def _sparse_attn_k64_kernel(
-    q, kv, o, attn_sink, topk_idxs, topk_lens,
-    stride_qm, stride_qh, stride_qd,
-    stride_kvn, stride_kvd,
-    stride_om, stride_oh, stride_od,
-    stride_topk_m, stride_topk_k,
+    q,
+    kv,
+    o,
+    attn_sink,
+    topk_idxs,
+    topk_lens,
+    stride_qm,
+    stride_qh,
+    stride_qd,
+    stride_kvn,
+    stride_kvd,
+    stride_om,
+    stride_oh,
+    stride_od,
+    stride_topk_m,
+    stride_topk_k,
     stride_lens_m,
-    num_queries, num_kv_rows, num_iters, scale,
+    num_queries,
+    num_kv_rows,
+    num_iters,
+    scale,
     BLOCK_H: gl.constexpr,
     BLOCK_D: gl.constexpr,
     NUM_XCDS: gl.constexpr,
@@ -71,9 +85,11 @@ def _sparse_attn_k64_kernel(
     store_layout: gl.constexpr = gl.BlockedLayout([1, 8], [16, 4], [4, 1], [1, 0])
 
     q_load_layout: gl.constexpr = gl.BlockedLayout(
-        [1, 8], [1, 64], [num_warps, 1], [1, 0])
+        [1, 8], [1, 64], [num_warps, 1], [1, 0]
+    )
     kv_load_layout: gl.constexpr = gl.BlockedLayout(
-        [8, 64 // num_warps], [64, 1], [1, num_warps], [0, 1])
+        [8, 64 // num_warps], [64, 1], [1, num_warps], [0, 1]
+    )
     slot_load_layout: gl.constexpr = gl.DistributedLinearLayout(
         reg_bases=[],
         lane_bases=[[1], [2], [4], [8], [16], [32]],
@@ -88,9 +104,21 @@ def _sparse_attn_k64_kernel(
     q_smem_layout: gl.constexpr = gl.PaddedSharedLayout(
         interval_padding_pairs=[[512, 16]],
         offset_bases=[
-            [0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32],
-            [0, 64], [0, 128], [0, 256],
-            [1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0],
+            [0, 1],
+            [0, 2],
+            [0, 4],
+            [0, 8],
+            [0, 16],
+            [0, 32],
+            [0, 64],
+            [0, 128],
+            [0, 256],
+            [1, 0],
+            [2, 0],
+            [4, 0],
+            [8, 0],
+            [16, 0],
+            [32, 0],
         ],
         cga_layout=[],
         shape=[BLOCK_H, BLOCK_D],
@@ -98,9 +126,21 @@ def _sparse_attn_k64_kernel(
     kv_smem_layout: gl.constexpr = gl.PaddedSharedLayout(
         interval_padding_pairs=[[512, 16]],
         offset_bases=[
-            [1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0],
-            [64, 0], [128, 0], [256, 0],
-            [0, 1], [0, 2], [0, 8], [0, 4], [0, 16], [0, 32],
+            [1, 0],
+            [2, 0],
+            [4, 0],
+            [8, 0],
+            [16, 0],
+            [32, 0],
+            [64, 0],
+            [128, 0],
+            [256, 0],
+            [0, 1],
+            [0, 2],
+            [0, 8],
+            [0, 4],
+            [0, 16],
+            [0, 32],
         ],
         cga_layout=[],
         shape=[BLOCK_D, BLOCK_K],
@@ -123,7 +163,9 @@ def _sparse_attn_k64_kernel(
     head_off = head_block_idx * BLOCK_H + gl.arange(0, BLOCK_H, layout=sl_h_q)
     dim_off = gl.arange(0, BLOCK_D, layout=sl_d_q)
     q_off = head_off[:, None] * stride_qh + dim_off[None, :] * stride_qd
-    q_smem = gl.allocate_shared_memory(q.dtype.element_ty, [BLOCK_H, BLOCK_D], q_smem_layout)
+    q_smem = gl.allocate_shared_memory(
+        q.dtype.element_ty, [BLOCK_H, BLOCK_D], q_smem_layout
+    )
     cdna4_async.buffer_load_to_shared(
         q_smem,
         q + query_idx * stride_qm,
@@ -135,9 +177,12 @@ def _sparse_attn_k64_kernel(
     LOG2E: gl.constexpr = 1.4426950408889634
     qk_scale = scale * LOG2E
     sink_head = head_block_idx * BLOCK_H + gl.arange(0, BLOCK_H, layout=sl_h_mma)
-    running_max = gl.load(
-        attn_sink + sink_head,
-    ).to(gl.float32) * LOG2E
+    running_max = (
+        gl.load(
+            attn_sink + sink_head,
+        ).to(gl.float32)
+        * LOG2E
+    )
     running_sum = gl.full([BLOCK_H], 1.0, gl.float32, sl_h_mma)
     acc = gl.zeros([BLOCK_H, BLOCK_D], gl.float32, mma)
 
@@ -147,7 +192,9 @@ def _sparse_attn_k64_kernel(
     dim_kv = gl.arange(0, BLOCK_D, layout=sl_d_kv)
     topk_base = topk_idxs + query_idx * stride_topk_m
 
-    index_smem = gl.allocate_shared_memory(topk_idxs.dtype.element_ty, [2, BLOCK_K], slot_smem_layout)
+    index_smem = gl.allocate_shared_memory(
+        topk_idxs.dtype.element_ty, [2, BLOCK_K], slot_smem_layout
+    )
     cdna4_async.buffer_load_to_shared(
         index_smem.index(0),
         topk_base,
@@ -163,24 +210,24 @@ def _sparse_attn_k64_kernel(
     cdna4_async.wait_group(2)
     q_dot = cdna4_async.load_shared_relaxed(q_smem, qk_a)
 
-    kv_smem = gl.allocate_shared_memory(kv.dtype.element_ty, [2, BLOCK_D, BLOCK_K], kv_smem_layout)
+    kv_smem = gl.allocate_shared_memory(
+        kv.dtype.element_ty, [2, BLOCK_D, BLOCK_K], kv_smem_layout
+    )
 
     cdna4_async.wait_group(1)
     index0 = cdna4_async.load_shared_relaxed(index_smem.index(0), sl_k_kv)
-    index0_mfma = cdna4_async.load_shared_relaxed(
-        index_smem.index(0), sl_k_mma)
+    index0_mfma = cdna4_async.load_shared_relaxed(index_smem.index(0), sl_k_mma)
     valid0_pos = k_pos < active_topk_len
     if ASSUME_COMPACT_INDICES:
         valid0 = valid0_pos
     else:
-        valid0 = (
-            valid0_pos & (index0 >= 0) & (index0.to(tl.int64) < num_kv_rows)
-        )
+        valid0 = valid0_pos & (index0 >= 0) & (index0.to(tl.int64) < num_kv_rows)
     kv_off0 = (
-        dim_kv[:, None] * stride_kvd
-        + gl.where(valid0, index0, 0)[None, :] * stride_kvn)
+        dim_kv[:, None] * stride_kvd + gl.where(valid0, index0, 0)[None, :] * stride_kvn
+    )
     cdna4_async.buffer_load_to_shared(
-        kv_smem.index(0), kv, kv_off0, mask=valid0[None, :])
+        kv_smem.index(0), kv, kv_off0, mask=valid0[None, :]
+    )
     cdna4_async.commit_group()
     valid_mfma_pos = k_pos_mfma < active_topk_len
     if ASSUME_COMPACT_INDICES:
@@ -203,21 +250,20 @@ def _sparse_attn_k64_kernel(
         cdna4_async.commit_group()
         cdna4_async.wait_group(1)
         current_buffer = i % 2
-        k_dot = cdna4_async.load_shared_relaxed(
-            kv_smem.index(current_buffer), qk_b)
+        k_dot = cdna4_async.load_shared_relaxed(kv_smem.index(current_buffer), qk_b)
         scores = gl.zeros([BLOCK_H, BLOCK_K], gl.float32, mma)
         scores = gl.amd.cdna4.mfma(q_dot, k_dot, scores)
 
         next_buffer = (i + 1) % 2
         cdna4_async.wait_group(2)
         next_index = cdna4_async.load_shared_relaxed(
-            index_smem.index(next_buffer), sl_k_kv)
-        next_pos = (i + 1) * BLOCK_K + k_pos
-        next_mfma_pos = (
-            (i + 1) * BLOCK_K + gl.arange(0, BLOCK_K, layout=sl_k_mma)
+            index_smem.index(next_buffer), sl_k_kv
         )
+        next_pos = (i + 1) * BLOCK_K + k_pos
+        next_mfma_pos = (i + 1) * BLOCK_K + gl.arange(0, BLOCK_K, layout=sl_k_mma)
         next_index_mfma = cdna4_async.load_shared_relaxed(
-            index_smem.index(next_buffer), sl_k_mma)
+            index_smem.index(next_buffer), sl_k_mma
+        )
         next_valid_pos = next_pos < active_topk_len
         if ASSUME_COMPACT_INDICES:
             next_valid = next_valid_pos
@@ -238,9 +284,11 @@ def _sparse_attn_k64_kernel(
             )
         next_kv_off = (
             dim_kv[:, None] * stride_kvd
-            + gl.where(next_valid, next_index, 0)[None, :] * stride_kvn)
+            + gl.where(next_valid, next_index, 0)[None, :] * stride_kvn
+        )
         cdna4_async.buffer_load_to_shared(
-            kv_smem.index(next_buffer), kv, next_kv_off, mask=next_valid[None, :])
+            kv_smem.index(next_buffer), kv, next_kv_off, mask=next_valid[None, :]
+        )
         cdna4_async.commit_group()
 
         current_valid = valid_mfma
@@ -253,7 +301,8 @@ def _sparse_attn_k64_kernel(
         running_sum = running_sum * alpha + gl.sum(p, axis=1)
         running_max = new_max
         v_dot = cdna4_async.load_shared_relaxed(
-            kv_smem.index(current_buffer).permute([1, 0]), qk_b)
+            kv_smem.index(current_buffer).permute([1, 0]), qk_b
+        )
         p_dot = gl.convert_layout(p.to(kv.dtype.element_ty), qk_a)
         acc *= alpha[:, None]
         acc = gl.amd.cdna4.mfma(p_dot, v_dot, acc)
@@ -264,7 +313,8 @@ def _sparse_attn_k64_kernel(
     final_pos = (num_iters - 1) * BLOCK_K + k_pos
     cdna4_async.wait_group(1)
     final_index = cdna4_async.load_shared_relaxed(
-        index_smem.index(final_buffer), sl_k_kv)
+        index_smem.index(final_buffer), sl_k_kv
+    )
     final_load_pos_valid = final_pos < active_topk_len
     if ASSUME_COMPACT_INDICES:
         final_load_valid = final_load_pos_valid
@@ -276,19 +326,22 @@ def _sparse_attn_k64_kernel(
         )
     final_kv_off = (
         dim_kv[:, None] * stride_kvd
-        + gl.where(final_load_valid, final_index, 0)[None, :] * stride_kvn)
+        + gl.where(final_load_valid, final_index, 0)[None, :] * stride_kvn
+    )
     cdna4_async.buffer_load_to_shared(
-        kv_smem.index(final_buffer), kv, final_kv_off, mask=final_load_valid[None, :])
+        kv_smem.index(final_buffer), kv, final_kv_off, mask=final_load_valid[None, :]
+    )
     cdna4_async.commit_group()
 
     cdna4_async.wait_group(1)
     penultimate_tile = num_iters - 2
     penultimate_buffer = penultimate_tile % 2
-    penultimate_pos = (
-        penultimate_tile * BLOCK_K + gl.arange(0, BLOCK_K, layout=sl_k_mma)
+    penultimate_pos = penultimate_tile * BLOCK_K + gl.arange(
+        0, BLOCK_K, layout=sl_k_mma
     )
     penultimate_index = cdna4_async.load_shared_relaxed(
-        index_smem.index(penultimate_buffer), sl_k_mma)
+        index_smem.index(penultimate_buffer), sl_k_mma
+    )
     penultimate_pos_valid = penultimate_pos < active_topk_len
     if ASSUME_COMPACT_INDICES:
         penultimate_valid = penultimate_pos_valid
@@ -298,8 +351,7 @@ def _sparse_attn_k64_kernel(
             & (penultimate_index >= 0)
             & (penultimate_index.to(tl.int64) < num_kv_rows)
         )
-    k_dot = cdna4_async.load_shared_relaxed(
-        kv_smem.index(penultimate_buffer), qk_b)
+    k_dot = cdna4_async.load_shared_relaxed(kv_smem.index(penultimate_buffer), qk_b)
     scores = gl.zeros([BLOCK_H, BLOCK_K], gl.float32, mma)
     scores = gl.amd.cdna4.mfma(q_dot, k_dot, scores)
     scores = gl.where(penultimate_valid[None, :], scores, float("-inf"))
@@ -311,17 +363,17 @@ def _sparse_attn_k64_kernel(
     running_sum = running_sum * alpha + gl.sum(p, axis=1)
     running_max = new_max
     v_dot = cdna4_async.load_shared_relaxed(
-        kv_smem.index(penultimate_buffer).permute([1, 0]), qk_b)
+        kv_smem.index(penultimate_buffer).permute([1, 0]), qk_b
+    )
     p_dot = gl.convert_layout(p.to(kv.dtype.element_ty), qk_a)
     acc *= alpha[:, None]
     acc = gl.amd.cdna4.mfma(p_dot, v_dot, acc)
 
     cdna4_async.wait_group(0)
-    final_mfma_pos = (
-        (num_iters - 1) * BLOCK_K + gl.arange(0, BLOCK_K, layout=sl_k_mma)
-    )
+    final_mfma_pos = (num_iters - 1) * BLOCK_K + gl.arange(0, BLOCK_K, layout=sl_k_mma)
     final_mfma_index = cdna4_async.load_shared_relaxed(
-        index_smem.index(final_buffer), sl_k_mma)
+        index_smem.index(final_buffer), sl_k_mma
+    )
     final_mfma_pos_valid = final_mfma_pos < active_topk_len
     if ASSUME_COMPACT_INDICES:
         final_valid = final_mfma_pos_valid
@@ -343,7 +395,8 @@ def _sparse_attn_k64_kernel(
     running_sum = running_sum * alpha + gl.sum(p, axis=1)
     running_max = new_max
     v_dot = cdna4_async.load_shared_relaxed(
-        kv_smem.index(final_buffer).permute([1, 0]), qk_b)
+        kv_smem.index(final_buffer).permute([1, 0]), qk_b
+    )
     p_dot = gl.convert_layout(p.to(kv.dtype.element_ty), qk_a)
     acc *= alpha[:, None]
     acc = gl.amd.cdna4.mfma(p_dot, v_dot, acc)
@@ -358,35 +411,52 @@ def _sparse_attn_k64_kernel(
 
     # Store the first BF16 half while the second half changes layout.
     output_bf16 = output.to(o.dtype.element_ty)
-    output_lo, output_hi = output_bf16.reshape(
-        [BLOCK_H, 2, BLOCK_D // 2]).permute([0, 2, 1]).split()
+    output_lo, output_hi = (
+        output_bf16.reshape([BLOCK_H, 2, BLOCK_D // 2]).permute([0, 2, 1]).split()
+    )
     out_head = head_block_idx * BLOCK_H + gl.arange(
-        0, BLOCK_H, layout=gl.SliceLayout(1, store_layout))
-    out_dim = gl.arange(
-        0, BLOCK_D // 2, layout=gl.SliceLayout(0, store_layout))
+        0, BLOCK_H, layout=gl.SliceLayout(1, store_layout)
+    )
+    out_dim = gl.arange(0, BLOCK_D // 2, layout=gl.SliceLayout(0, store_layout))
     output_lo = gl.convert_layout(output_lo, store_layout)
     out_off = out_head[:, None] * stride_oh + out_dim[None, :] * stride_od
     gl.store(
-        o + query_idx * stride_om + out_off, output_lo,
+        o + query_idx * stride_om + out_off,
+        output_lo,
     )
     output_hi = gl.convert_layout(output_hi, store_layout)
     out_off = (
-        out_head[:, None] * stride_oh
-        + (BLOCK_D // 2 + out_dim[None, :]) * stride_od)
+        out_head[:, None] * stride_oh + (BLOCK_D // 2 + out_dim[None, :]) * stride_od
+    )
     gl.store(
-        o + query_idx * stride_om + out_off, output_hi,
+        o + query_idx * stride_om + out_off,
+        output_hi,
     )
 
 
 @gluon.jit
 def _sparse_attn_k32_kernel(
-    q, kv, o, attn_sink, topk_idxs, topk_lens,
-    stride_qm, stride_qh, stride_qd,
-    stride_kvn, stride_kvd,
-    stride_om, stride_oh, stride_od,
-    stride_topk_m, stride_topk_k,
+    q,
+    kv,
+    o,
+    attn_sink,
+    topk_idxs,
+    topk_lens,
+    stride_qm,
+    stride_qh,
+    stride_qd,
+    stride_kvn,
+    stride_kvd,
+    stride_om,
+    stride_oh,
+    stride_od,
+    stride_topk_m,
+    stride_topk_k,
     stride_lens_m,
-    num_queries, num_kv_rows, num_iters, scale,
+    num_queries,
+    num_kv_rows,
+    num_iters,
+    scale,
     BLOCK_H: gl.constexpr,
     BLOCK_D: gl.constexpr,
     NUM_XCDS: gl.constexpr,
@@ -405,9 +475,11 @@ def _sparse_attn_k32_kernel(
     store_layout: gl.constexpr = gl.BlockedLayout([1, 8], [16, 4], [4, 1], [1, 0])
 
     q_load_layout: gl.constexpr = gl.BlockedLayout(
-        [1, 8], [1, 64], [num_warps, 1], [1, 0])
+        [1, 8], [1, 64], [num_warps, 1], [1, 0]
+    )
     kv_load_layout: gl.constexpr = gl.BlockedLayout(
-        [8, 32 // num_warps], [64, 1], [1, num_warps], [0, 1])
+        [8, 32 // num_warps], [64, 1], [1, num_warps], [0, 1]
+    )
     # The 32-wide async index layout does not lower cleanly. K32 loads
     # indices directly into the KV-column distribution instead.
     slot_load_layout: gl.constexpr = gl.SliceLayout(0, kv_load_layout)
@@ -419,9 +491,21 @@ def _sparse_attn_k32_kernel(
     q_smem_layout: gl.constexpr = gl.PaddedSharedLayout(
         interval_padding_pairs=[[512, 16]],
         offset_bases=[
-            [0, 1], [0, 2], [0, 4], [0, 8], [0, 16], [0, 32],
-            [0, 64], [0, 128], [0, 256],
-            [1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0],
+            [0, 1],
+            [0, 2],
+            [0, 4],
+            [0, 8],
+            [0, 16],
+            [0, 32],
+            [0, 64],
+            [0, 128],
+            [0, 256],
+            [1, 0],
+            [2, 0],
+            [4, 0],
+            [8, 0],
+            [16, 0],
+            [32, 0],
         ],
         cga_layout=[],
         shape=[BLOCK_H, BLOCK_D],
@@ -429,9 +513,20 @@ def _sparse_attn_k32_kernel(
     kv_smem_layout: gl.constexpr = gl.PaddedSharedLayout(
         interval_padding_pairs=[[512, 16]],
         offset_bases=[
-            [1, 0], [2, 0], [4, 0], [8, 0], [16, 0], [32, 0],
-            [64, 0], [128, 0], [256, 0],
-            [0, 1], [0, 2], [0, 8], [0, 4], [0, 16],
+            [1, 0],
+            [2, 0],
+            [4, 0],
+            [8, 0],
+            [16, 0],
+            [32, 0],
+            [64, 0],
+            [128, 0],
+            [256, 0],
+            [0, 1],
+            [0, 2],
+            [0, 8],
+            [0, 4],
+            [0, 16],
         ],
         cga_layout=[],
         shape=[BLOCK_D, BLOCK_K],
@@ -454,7 +549,9 @@ def _sparse_attn_k32_kernel(
     head_off = head_block_idx * BLOCK_H + gl.arange(0, BLOCK_H, layout=sl_h_q)
     dim_off = gl.arange(0, BLOCK_D, layout=sl_d_q)
     q_off = head_off[:, None] * stride_qh + dim_off[None, :] * stride_qd
-    q_smem = gl.allocate_shared_memory(q.dtype.element_ty, [BLOCK_H, BLOCK_D], q_smem_layout)
+    q_smem = gl.allocate_shared_memory(
+        q.dtype.element_ty, [BLOCK_H, BLOCK_D], q_smem_layout
+    )
     cdna4_async.buffer_load_to_shared(
         q_smem,
         q + query_idx * stride_qm,
@@ -466,9 +563,12 @@ def _sparse_attn_k32_kernel(
     LOG2E: gl.constexpr = 1.4426950408889634
     qk_scale = scale * LOG2E
     sink_head = head_block_idx * BLOCK_H + gl.arange(0, BLOCK_H, layout=sl_h_mma)
-    running_max = gl.load(
-        attn_sink + sink_head,
-    ).to(gl.float32) * LOG2E
+    running_max = (
+        gl.load(
+            attn_sink + sink_head,
+        ).to(gl.float32)
+        * LOG2E
+    )
     running_sum = gl.full([BLOCK_H], 1.0, gl.float32, sl_h_mma)
     acc = gl.zeros([BLOCK_H, BLOCK_D], gl.float32, mma)
 
@@ -478,11 +578,15 @@ def _sparse_attn_k32_kernel(
     dim_kv = gl.arange(0, BLOCK_D, layout=sl_d_kv)
     topk_base = topk_idxs + query_idx * stride_topk_m
 
-    index_smem = gl.allocate_shared_memory(topk_idxs.dtype.element_ty, [2, BLOCK_K], slot_smem_layout)
+    index_smem = gl.allocate_shared_memory(
+        topk_idxs.dtype.element_ty, [2, BLOCK_K], slot_smem_layout
+    )
     cdna4_async.wait_group(0)
     q_dot = cdna4_async.load_shared_relaxed(q_smem, qk_a)
 
-    kv_smem = gl.allocate_shared_memory(kv.dtype.element_ty, [2, BLOCK_D, BLOCK_K], kv_smem_layout)
+    kv_smem = gl.allocate_shared_memory(
+        kv.dtype.element_ty, [2, BLOCK_D, BLOCK_K], kv_smem_layout
+    )
 
     index0 = gl.load(
         topk_base + k_pos * stride_topk_k,
@@ -494,14 +598,13 @@ def _sparse_attn_k32_kernel(
     if ASSUME_COMPACT_INDICES:
         valid0 = valid0_pos
     else:
-        valid0 = (
-            valid0_pos & (index0 >= 0) & (index0.to(tl.int64) < num_kv_rows)
-        )
+        valid0 = valid0_pos & (index0 >= 0) & (index0.to(tl.int64) < num_kv_rows)
     kv_off0 = (
-        dim_kv[:, None] * stride_kvd
-        + gl.where(valid0, index0, 0)[None, :] * stride_kvn)
+        dim_kv[:, None] * stride_kvd + gl.where(valid0, index0, 0)[None, :] * stride_kvn
+    )
     cdna4_async.buffer_load_to_shared(
-        kv_smem.index(0), kv, kv_off0, mask=valid0[None, :])
+        kv_smem.index(0), kv, kv_off0, mask=valid0[None, :]
+    )
     cdna4_async.commit_group()
     valid_mfma_pos = k_pos_mfma < active_topk_len
     if ASSUME_COMPACT_INDICES:
@@ -517,8 +620,7 @@ def _sparse_attn_k32_kernel(
     for i in tl.range(0, num_iters - 2):
         cdna4_async.wait_group(0)
         current_buffer = i % 2
-        k_dot = cdna4_async.load_shared_relaxed(
-            kv_smem.index(current_buffer), qk_b)
+        k_dot = cdna4_async.load_shared_relaxed(kv_smem.index(current_buffer), qk_b)
         scores = gl.zeros([BLOCK_H, BLOCK_K], gl.float32, mma)
         scores = gl.amd.cdna4.mfma(q_dot, k_dot, scores)
 
@@ -528,9 +630,7 @@ def _sparse_attn_k32_kernel(
             topk_base + next_pos * stride_topk_k,
         )
         next_pos = (i + 1) * BLOCK_K + k_pos
-        next_mfma_pos = (
-            (i + 1) * BLOCK_K + gl.arange(0, BLOCK_K, layout=sl_k_mma)
-        )
+        next_mfma_pos = (i + 1) * BLOCK_K + gl.arange(0, BLOCK_K, layout=sl_k_mma)
         next_index_mfma = gl.load(
             topk_base + next_mfma_pos * stride_topk_k,
         )
@@ -554,9 +654,11 @@ def _sparse_attn_k32_kernel(
             )
         next_kv_off = (
             dim_kv[:, None] * stride_kvd
-            + gl.where(next_valid, next_index, 0)[None, :] * stride_kvn)
+            + gl.where(next_valid, next_index, 0)[None, :] * stride_kvn
+        )
         cdna4_async.buffer_load_to_shared(
-            kv_smem.index(next_buffer), kv, next_kv_off, mask=next_valid[None, :])
+            kv_smem.index(next_buffer), kv, next_kv_off, mask=next_valid[None, :]
+        )
         cdna4_async.commit_group()
 
         current_valid = valid_mfma
@@ -569,7 +671,8 @@ def _sparse_attn_k32_kernel(
         running_sum = running_sum * alpha + gl.sum(p, axis=1)
         running_max = new_max
         v_dot = cdna4_async.load_shared_relaxed(
-            kv_smem.index(current_buffer).permute([1, 0]), qk_b)
+            kv_smem.index(current_buffer).permute([1, 0]), qk_b
+        )
         p_dot = gl.convert_layout(p.to(kv.dtype.element_ty), qk_a)
         acc *= alpha[:, None]
         acc = gl.amd.cdna4.mfma(p_dot, v_dot, acc)
@@ -592,16 +695,18 @@ def _sparse_attn_k32_kernel(
         )
     final_kv_off = (
         dim_kv[:, None] * stride_kvd
-        + gl.where(final_load_valid, final_index, 0)[None, :] * stride_kvn)
+        + gl.where(final_load_valid, final_index, 0)[None, :] * stride_kvn
+    )
     cdna4_async.buffer_load_to_shared(
-        kv_smem.index(final_buffer), kv, final_kv_off, mask=final_load_valid[None, :])
+        kv_smem.index(final_buffer), kv, final_kv_off, mask=final_load_valid[None, :]
+    )
     cdna4_async.commit_group()
 
     cdna4_async.wait_group(1)
     penultimate_tile = num_iters - 2
     penultimate_buffer = penultimate_tile % 2
-    penultimate_pos = (
-        penultimate_tile * BLOCK_K + gl.arange(0, BLOCK_K, layout=sl_k_mma)
+    penultimate_pos = penultimate_tile * BLOCK_K + gl.arange(
+        0, BLOCK_K, layout=sl_k_mma
     )
     penultimate_index = gl.load(
         topk_base + penultimate_pos * stride_topk_k,
@@ -615,8 +720,7 @@ def _sparse_attn_k32_kernel(
             & (penultimate_index >= 0)
             & (penultimate_index.to(tl.int64) < num_kv_rows)
         )
-    k_dot = cdna4_async.load_shared_relaxed(
-        kv_smem.index(penultimate_buffer), qk_b)
+    k_dot = cdna4_async.load_shared_relaxed(kv_smem.index(penultimate_buffer), qk_b)
     scores = gl.zeros([BLOCK_H, BLOCK_K], gl.float32, mma)
     scores = gl.amd.cdna4.mfma(q_dot, k_dot, scores)
     scores = gl.where(penultimate_valid[None, :], scores, float("-inf"))
@@ -628,15 +732,14 @@ def _sparse_attn_k32_kernel(
     running_sum = running_sum * alpha + gl.sum(p, axis=1)
     running_max = new_max
     v_dot = cdna4_async.load_shared_relaxed(
-        kv_smem.index(penultimate_buffer).permute([1, 0]), qk_b)
+        kv_smem.index(penultimate_buffer).permute([1, 0]), qk_b
+    )
     p_dot = gl.convert_layout(p.to(kv.dtype.element_ty), qk_a)
     acc *= alpha[:, None]
     acc = gl.amd.cdna4.mfma(p_dot, v_dot, acc)
 
     cdna4_async.wait_group(0)
-    final_mfma_pos = (
-        (num_iters - 1) * BLOCK_K + gl.arange(0, BLOCK_K, layout=sl_k_mma)
-    )
+    final_mfma_pos = (num_iters - 1) * BLOCK_K + gl.arange(0, BLOCK_K, layout=sl_k_mma)
     final_mfma_index = gl.load(
         topk_base + final_mfma_pos * stride_topk_k,
     )
@@ -661,7 +764,8 @@ def _sparse_attn_k32_kernel(
     running_sum = running_sum * alpha + gl.sum(p, axis=1)
     running_max = new_max
     v_dot = cdna4_async.load_shared_relaxed(
-        kv_smem.index(final_buffer).permute([1, 0]), qk_b)
+        kv_smem.index(final_buffer).permute([1, 0]), qk_b
+    )
     p_dot = gl.convert_layout(p.to(kv.dtype.element_ty), qk_a)
     acc *= alpha[:, None]
     acc = gl.amd.cdna4.mfma(p_dot, v_dot, acc)
@@ -676,23 +780,26 @@ def _sparse_attn_k32_kernel(
 
     # Store the first BF16 half while the second half changes layout.
     output_bf16 = output.to(o.dtype.element_ty)
-    output_lo, output_hi = output_bf16.reshape(
-        [BLOCK_H, 2, BLOCK_D // 2]).permute([0, 2, 1]).split()
+    output_lo, output_hi = (
+        output_bf16.reshape([BLOCK_H, 2, BLOCK_D // 2]).permute([0, 2, 1]).split()
+    )
     out_head = head_block_idx * BLOCK_H + gl.arange(
-        0, BLOCK_H, layout=gl.SliceLayout(1, store_layout))
-    out_dim = gl.arange(
-        0, BLOCK_D // 2, layout=gl.SliceLayout(0, store_layout))
+        0, BLOCK_H, layout=gl.SliceLayout(1, store_layout)
+    )
+    out_dim = gl.arange(0, BLOCK_D // 2, layout=gl.SliceLayout(0, store_layout))
     output_lo = gl.convert_layout(output_lo, store_layout)
     out_off = out_head[:, None] * stride_oh + out_dim[None, :] * stride_od
     gl.store(
-        o + query_idx * stride_om + out_off, output_lo,
+        o + query_idx * stride_om + out_off,
+        output_lo,
     )
     output_hi = gl.convert_layout(output_hi, store_layout)
     out_off = (
-        out_head[:, None] * stride_oh
-        + (BLOCK_D // 2 + out_dim[None, :]) * stride_od)
+        out_head[:, None] * stride_oh + (BLOCK_D // 2 + out_dim[None, :]) * stride_od
+    )
     gl.store(
-        o + query_idx * stride_om + out_off, output_hi,
+        o + query_idx * stride_om + out_off,
+        output_hi,
     )
 
 
@@ -754,13 +861,26 @@ def gluon_dsv4_sparse_prefill_gfx950(
     grid = (num_xcds, triton.cdiv(h, 64), triton.cdiv(s, num_xcds))
     kernel = _sparse_attn_k64_kernel if block_k == 64 else _sparse_attn_k32_kernel
     kernel[grid](
-        q4, kv3, o4, attn_sink.reshape(-1), topk3, lens_1d,
-        q4.stride(1), q4.stride(2), q4.stride(3),
-        kv3.stride(1), kv3.stride(2),
-        o4.stride(1), o4.stride(2), o4.stride(3),
-        topk3.stride(1), topk3.stride(2),
+        q4,
+        kv3,
+        o4,
+        attn_sink.reshape(-1),
+        topk3,
+        lens_1d,
+        q4.stride(1),
+        q4.stride(2),
+        q4.stride(3),
+        kv3.stride(1),
+        kv3.stride(2),
+        o4.stride(1),
+        o4.stride(2),
+        o4.stride(3),
+        topk3.stride(1),
+        topk3.stride(2),
         lens_1d.stride(0),
-        s, kv3.shape[1], topk3.size(2) // block_k,
+        s,
+        kv3.shape[1],
+        topk3.size(2) // block_k,
         float(softmax_scale),
         BLOCK_H=64,
         BLOCK_D=512,

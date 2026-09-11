@@ -18,6 +18,8 @@
 # OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 # SOFTWARE.
 
+"""Static AMD kernel checks that skip when optional packages are unavailable."""
+
 from __future__ import annotations
 
 import inspect
@@ -27,6 +29,7 @@ from types import SimpleNamespace
 import pytest
 
 pytest.importorskip("tokenspeed_triton")
+pytest.importorskip("tokenspeed_kernel_amd", reason="AMD kernel package is optional")
 
 from tokenspeed_kernel_amd.ops.gfx950.attention import dsv4 as dsv4_pkg  # noqa: E402
 from tokenspeed_kernel_amd.ops.gfx950.attention.dsv4 import (  # noqa: E402
@@ -58,7 +61,7 @@ def test_registered_prefill_wrapper_routes_target_shapes_to_sparse_helper():
 
 
 def test_sparse_prefill_masks_invalid_selected_rows_before_kv_loads():
-    source = Path(sparse_prefill.__file__).read_text()
+    source = " ".join(Path(sparse_prefill.__file__).read_text().split())
 
     assert "num_queries, num_kv_rows, num_iters" in source
     assert "assert topk3.size(2) % block_k == 0" in source
